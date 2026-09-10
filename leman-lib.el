@@ -225,7 +225,7 @@ struct, or a room ID or alias string."
   (when (or force-p (yes-or-no-p (format "Leave room %s? " (leman--format-room room))))
     (pcase-let* (((cl-struct leman-room id) room)
                  (endpoint (format "rooms/%s/leave" (url-hexify-string id))))
-      (leman-api session endpoint :method 'post :data ""
+      (leman-api session endpoint :method 'post :data "{}"
         :then (lambda (_data)
                 (when leman-room-leave-kill-buffer
                   ;; NOTE: This generates a symbol and sets its function value to a lambda
@@ -278,7 +278,7 @@ when necessary, and forget the room without prompting."
                (user-error "Room %s is joined (must be left before forgetting)"
                            (leman--format-room room))))
       ('leave (when (or force-p (yes-or-no-p (format "Forget room \"%s\" (%s)? " display-name id)))
-                (leman-api session endpoint :method 'post :data ""
+                (leman-api session endpoint :method 'post :data "{}"
                   :then (lambda (_data)
                           ;; NOTE: The spec does not seem to indicate that the action of forgetting
                           ;; a room is synced to other clients, so it seems that we need to remove
