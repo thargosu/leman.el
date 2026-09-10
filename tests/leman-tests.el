@@ -28,6 +28,7 @@
 
 (require 'leman-lib)
 (require 'leman-room)
+(require 'leman-room-list)
 
 ;; Variables from leman.el, which the tests don't load.
 (defvar leman-users)
@@ -252,6 +253,30 @@ URL differ from the previous one."
     ;; For an invited space, the invitation takes precedence.
     (should (string-search "invited to this room"
                            (substring-no-properties (leman-room--initial-footer invited-space))))))
+
+(defun leman-tests--taxy-items (taxy)
+  "Return all of TAXY's items, including those in its sub-taxys."
+  (append (taxy-items taxy)
+          (cl-loop for sub-taxy in (taxy-taxys taxy)
+                   append (leman-tests--taxy-items sub-taxy))))
+
+(ert-deftest leman-room-list--build-taxy ()
+  "Test building the room list taxy."
+  (let* ((room-old (make-leman-room :id "!old:example.com" :latest-ts 100))
+         (room-new (make-leman-room :id "!new:example.com" :latest-ts 200))
+         (session (make-leman-session :user (make-leman-user :id "@me:example.com")))
+         (taxy (leman-room-list--build-taxy
+                (list (vector room-old session) (vector room-new session))
+                leman-room-list-default-keys
+                #'identity))
+         (items (mapcar (lambda (item) (elt item 0))
+                        (leman-tests--taxy-items taxy))))
+    (should (equal "Leman Rooms" (taxy-name taxy)))
+    (should (member room-new items))
+    (should (member room-old items))
+    ;; Rooms are sorted latest-first.
+    (should (< (cl-position room-new items :test #'equal)
+               (cl-position room-old items :test #'equal)))))
 
 (provide 'leman-tests)
 

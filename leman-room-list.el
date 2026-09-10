@@ -601,11 +601,87 @@ To be called from `leman-after-initial-sync-hook'."
 (defalias 'leman-list-rooms 'leman-room-list)
 
 ;;;###autoload
+(defun leman-room-list--build-taxy (room-session-vectors keys format-fn)
+  "Build the room list taxy from ROOM-SESSION-VECTORS grouped by KEYS.
+FORMAT-FN is used to format each item."
+  (cl-labels (;; NOTE: Since these functions take an "item" (which is a [room session]
+              ;; vector), they're prefixed "item-" rather than "room-".
+              (item-latest-ts (item)
+                (or (leman-room-latest-ts (elt item 0))
+                    ;; Room has no latest timestamp.  FIXME: This shouldn't
+                    ;; happen, but it can, maybe due to oversights elsewhere.
+                    0))
+              (item-unread-p (item)
+                (pcase-let ((`[,room ,session] item))
+                  (leman--room-unread-p room session)))
+              (item-left-p (item)
+                (pcase-let ((`[,(cl-struct leman-room status) ,_session] item))
+                  (equal 'leave status)))
+              (item-space-p (item)
+                (pcase-let ((`[,(cl-struct leman-room type) ,_session] item))
+                  (equal "m.space" type)))
+              (item-favourite-p (item)
+                (pcase-let ((`[,room ,_session] item))
+                  (leman--room-favourite-p room)))
+              (item-low-priority-p (item)
+                (pcase-let ((`[,room ,_session] item))
+                  (leman--room-low-priority-p room)))
+              (item-invited-p (item)
+                (pcase-let ((`[,(cl-struct leman-room status) ,_session] item))
+                  (equal 'invite status)))
+              (taxy-latest-ts (taxy)
+                (apply #'max most-negative-fixnum
+                       (delq nil
+                             (list
+                              (when (taxy-items taxy)
+                                (item-latest-ts (car (taxy-items taxy))))
+                              (when (taxy-taxys taxy)
+                                (cl-loop for sub-taxy in (taxy-taxys taxy)
+                                         maximizing (taxy-latest-ts sub-taxy)))))))
+              (t<nil (a b) (and a (not b)))
+              (t>nil (a b) (and (not a) b))
+              (make-fn (&rest args)
+                (apply #'make-taxy-magit-section
+                       :make #'make-fn
+                       :format-fn format-fn
+                       :level-indent leman-room-list-level-indent
+                       :item-indent 2
+                       args)))
+    (cl-macrolet ((first-item
+                    (pred) `(lambda (taxy)
+                              (when (taxy-items taxy)
+                                (,pred (car (taxy-items taxy))))))
+                  (name= (name) `(lambda (taxy)
+                                   (equal ,name (taxy-name taxy)))))
+      (thread-last
+        (make-fn
+         :name "Leman Rooms"
+         :take (taxy-make-take-function keys leman-room-list-keys))
+        (taxy-fill room-session-vectors)
+        (taxy-sort #'> #'item-latest-ts)
+        (taxy-sort #'t<nil #'item-invited-p)
+        (taxy-sort #'t<nil #'item-favourite-p)
+        (taxy-sort #'t>nil #'item-low-priority-p)
+        (taxy-sort #'t<nil #'item-unread-p)
+        (taxy-sort #'t<nil #'item-space-p)
+        ;; Within each taxy, left rooms should be sorted last so that one
+        ;; can never be the first room in the taxy (unless it's the taxy
+        ;; of left rooms), which would cause the taxy to be incorrectly
+        ;; sorted last.
+        (taxy-sort #'t>nil #'item-left-p)
+        (taxy-sort* #'string< #'taxy-name)
+        (taxy-sort* #'> #'taxy-latest-ts)
+        (taxy-sort* #'t<nil (name= "Buffers"))
+        (taxy-sort* #'t<nil (first-item item-unread-p))
+        (taxy-sort* #'t<nil (first-item item-favourite-p))
+        (taxy-sort* #'t<nil (first-item item-invited-p))
+        (taxy-sort* #'t>nil (first-item item-space-p))
+        (taxy-sort* #'t>nil (name= "Low-priority"))
+        (taxy-sort* #'t>nil (first-item item-left-p))))))
+
 (cl-defun leman-room-list (&key (buffer-name "*Leman Room List*")
                                 (keys leman-room-list-default-keys)
-                                (display-buffer-action '((display-buffer-reuse-window display-buffer-same-window)))
-                                ;; visibility-fn
-                                )
+                                (display-buffer-action '((display-buffer-reuse-window display-buffer-same-window))))
   "Show a buffer listing Leman rooms, grouped with Taxy KEYS.
 After showing it, its window is selected.  The buffer is named
 BUFFER-NAME and is shown with DISPLAY-BUFFER-ACTION; or if
@@ -613,71 +689,7 @@ DISPLAY-BUFFER-ACTION is nil, the buffer is not displayed."
   (interactive)
   (let ((window-start 0) (window-point 0)
         format-table column-sizes)
-    (cl-labels (;; (heading-face
-                ;;  (depth) (list :inherit (list 'bufler-group (bufler-level-face depth))))
-                (format-item (item) (gethash item format-table))
-                ;; NOTE: Since these functions take an "item" (which is a [room session]
-                ;; vector), they're prefixed "item-" rather than "room-".
-                (item-latest-ts (item)
-                  (or (leman-room-latest-ts (elt item 0))
-                      ;; Room has no latest timestamp.  FIXME: This shouldn't
-                      ;; happen, but it can, maybe due to oversights elsewhere.
-                      0))
-                (item-unread-p (item)
-                  (pcase-let ((`[,room ,session] item))
-                    (leman--room-unread-p room session)))
-                (item-left-p (item)
-                  (pcase-let ((`[,(cl-struct leman-room status) ,_session] item))
-                    (equal 'leave status)))
-                (item-buffer-p (item)
-                  (pcase-let ((`[,(cl-struct leman-room (local (map buffer))) ,_session] item))
-                    (buffer-live-p buffer)))
-                (taxy-unread-p (taxy)
-                  (or (cl-some #'item-unread-p (taxy-items taxy))
-                      (cl-some #'taxy-unread-p (taxy-taxys taxy))))
-                (item-space-p (item)
-                  (pcase-let ((`[,(cl-struct leman-room type) ,_session] item))
-                    (equal "m.space" type)))
-                (item-favourite-p (item)
-                  (pcase-let ((`[,room ,_session] item))
-                    (leman--room-favourite-p room)))
-                (item-low-priority-p (item)
-                  (pcase-let ((`[,room ,_session] item))
-                    (leman--room-low-priority-p room)))
-                (visible-p (section)
-                  ;; This is very confusing and doesn't currently work.
-                  (let ((value (oref section value)))
-                    (if (cl-typecase value
-                          (taxy-magit-section (item-unread-p value))
-                          (leman-room nil))
-                        'show
-                      'hide)))
-                (item-invited-p (item)
-                  (pcase-let ((`[,(cl-struct leman-room status) ,_session] item))
-                    (equal 'invite status)))
-                (taxy-latest-ts (taxy)
-                  (apply #'max most-negative-fixnum
-                         (delq nil
-                               (list
-                                (when (taxy-items taxy)
-                                  (item-latest-ts (car (taxy-items taxy))))
-                                (when (taxy-taxys taxy)
-                                  (cl-loop for sub-taxy in (taxy-taxys taxy)
-                                           maximizing (taxy-latest-ts sub-taxy)))))))
-                (t<nil (a b) (and a (not b)))
-                (t>nil (a b) (and (not a) b))
-                (make-fn (&rest args)
-                  (apply #'make-taxy-magit-section
-                         :make #'make-fn
-                         :format-fn #'format-item
-                         :level-indent leman-room-list-level-indent
-                         ;; :visibility-fn #'visible-p
-                         ;; :heading-indent 2
-                         :item-indent 2
-                         ;; :heading-face-fn #'heading-face
-                         args)))
-      ;; (when (get-buffer buffer-name)
-      ;;   (kill-buffer buffer-name))
+    (cl-labels ((format-item (item) (gethash item format-table)))
       (unless leman-sessions
         (error "Leman: Not connected.  Use `leman-connect' to connect"))
       (if (not (cl-loop for (_id . session) in leman-sessions
@@ -690,37 +702,7 @@ DISPLAY-BUFFER-ACTION is nil, the buffer is not displayed."
                   (cl-loop for (_id . session) in leman-sessions
                            append (cl-loop for room in (leman-session-rooms session)
                                            collect (vector room session))))
-                 (taxy (cl-macrolet ((first-item
-                                       (pred) `(lambda (taxy)
-                                                 (when (taxy-items taxy)
-                                                   (,pred (car (taxy-items taxy))))))
-                                     (name= (name) `(lambda (taxy)
-                                                      (equal ,name (taxy-name taxy)))))
-                         (thread-last
-                           (make-fn
-                            :name "Leman Rooms"
-                            :take (taxy-make-take-function keys leman-room-list-keys))
-                           (taxy-fill room-session-vectors)
-                           (taxy-sort #'> #'item-latest-ts)
-                           (taxy-sort #'t<nil #'item-invited-p)
-                           (taxy-sort #'t<nil #'item-favourite-p)
-                           (taxy-sort #'t>nil #'item-low-priority-p)
-                           (taxy-sort #'t<nil #'item-unread-p)
-                           (taxy-sort #'t<nil #'item-space-p)
-                           ;; Within each taxy, left rooms should be sorted last so that one
-                           ;; can never be the first room in the taxy (unless it's the taxy
-                           ;; of left rooms), which would cause the taxy to be incorrectly
-                           ;; sorted last.
-                           (taxy-sort #'t>nil #'item-left-p)
-                           (taxy-sort* #'string< #'taxy-name)
-                           (taxy-sort* #'> #'taxy-latest-ts)
-                           (taxy-sort* #'t<nil (name= "Buffers"))
-                           (taxy-sort* #'t<nil (first-item item-unread-p))
-                           (taxy-sort* #'t<nil (first-item item-favourite-p))
-                           (taxy-sort* #'t<nil (first-item item-invited-p))
-                           (taxy-sort* #'t>nil (first-item item-space-p))
-                           (taxy-sort* #'t>nil (name= "Low-priority"))
-                           (taxy-sort* #'t>nil (first-item item-left-p)))))
+                 (taxy (leman-room-list--build-taxy room-session-vectors keys #'format-item))
                  (taxy-magit-section-insert-indent-items nil)
                  (inhibit-read-only t)
                  (format-cons (taxy-magit-section-format-items
@@ -743,7 +725,6 @@ DISPLAY-BUFFER-ACTION is nil, the buffer is not displayed."
             (erase-buffer)
             (save-excursion
               (taxy-magit-section-insert taxy :items 'first
-                ;; :blank-between-depth bufler-taxy-blank-between-depth
                 :initial-depth 0 :section-class 'leman-room-list-section))
             (if-let* ((section-ident)
                       (section (magit-get-section section-ident)))
