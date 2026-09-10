@@ -367,6 +367,27 @@ Colors are taken from `leman-tabulated-room-list-timestamp-colors'."
                       (+ 24 (truncate (/ difference-seconds 86400 7))))))))
       (list :foreground (elt leman-tabulated-room-list-timestamp-colors n)))))
 
+(defun leman-tabulated-room-list--name-face (room buffer session status)
+  "Return the face specification for ROOM's entry name.
+BUFFER is the room's buffer, if any, SESSION the room's session,
+and STATUS the room's status."
+  ;; We have to copy the list, otherwise using `setf' on it
+  ;; later causes its value to be mutated for every entry.
+  (let ((face (cl-copy-list '(:inherit (leman-tabulated-room-list-name)))))
+    ;; Add face modifiers.
+    (when (and buffer (buffer-modified-p buffer))
+      (push 'leman-tabulated-room-list-unread (map-elt face :inherit)))
+    (when (leman--room-direct-p room session)
+      (push 'leman-tabulated-room-list-direct (map-elt face :inherit)))
+    (when (leman--room-favourite-p room)
+      (push 'leman-tabulated-room-list-favourite (map-elt face :inherit)))
+    (when (leman--room-low-priority-p room)
+      (push 'leman-tabulated-room-list-low-priority (map-elt face :inherit)))
+    (pcase status
+      ('invite (push 'leman-tabulated-room-list-invited (map-elt face :inherit)))
+      ('leave (push 'leman-tabulated-room-list-left (map-elt face :inherit))))
+    face))
+
 (defun leman-tabulated-room-list--entry (session room)
   "Return entry for ROOM in SESSION for `tabulated-list-entries'."
   (pcase-let* (((cl-struct leman-room id canonical-alias display-name avatar topic latest-ts summary
@@ -382,9 +403,7 @@ Colors are taken from `leman-tabulated-room-list-timestamp-colors'."
                              (propertize "U" 'help-echo "Unread") ""))
                (e-buffer (if buffer (propertize "B" 'help-echo "Room has buffer") ""))
                (e-avatar (leman-tabulated-room-list--avatar room avatar room-list-avatar))
-               ;; We have to copy the list, otherwise using `setf' on it
-               ;; later causes its value to be mutated for every entry.
-               (name-face (cl-copy-list '(:inherit (leman-tabulated-room-list-name))))
+               (name-face (leman-tabulated-room-list--name-face room buffer session (leman-room-status room)))
                (e-name (list (propertize (or display-name
                                              (leman--room-display-name room))
                                          ;; HACK: Apply face here, otherwise tabulated-list overrides it.
@@ -415,33 +434,23 @@ Colors are taken from `leman-tabulated-room-list-timestamp-colors'."
                                  ((leman--room-low-priority-p room) "l")
                                  (" ")))
                (e-members (if member-count (number-to-string member-count) "")))
-     (when leman-tabulated-room-list-simplify-timestamps
-       (setf e-latest (replace-regexp-in-string
-                       (rx bos (1+ digit) (1+ alpha) (group (1+ (1+ digit) (1+ alpha))))
-                       "" e-latest t t 1)))
-     ;; Add face modifiers.
-     (when (and buffer (buffer-modified-p buffer))
-       (push 'leman-tabulated-room-list-unread (map-elt name-face :inherit)))
-     (when (leman--room-direct-p room session)
-       (push 'leman-tabulated-room-list-direct (map-elt name-face :inherit)))
-     (when (leman--room-favourite-p room)
-       (push 'leman-tabulated-room-list-favourite (map-elt name-face :inherit)))
-     (when (leman--room-low-priority-p room)
-       (push 'leman-tabulated-room-list-low-priority (map-elt name-face :inherit)))
-     (pcase (leman-room-status room)
-       ('invite
-        (setf e-topic (concat (propertize "[invited]"
-                                          'face 'leman-tabulated-room-list-invited)
-                              " " e-topic))
-        (push 'leman-tabulated-room-list-invited (map-elt name-face :inherit)))
-       ('leave
-        (setf e-topic (concat (propertize "[left]"
-                                          'face 'leman-tabulated-room-list-left)
-                              " " e-topic))
-        (push 'leman-tabulated-room-list-left (map-elt name-face :inherit))))
-     (list room (vector e-unread e-priority e-buffer e-direct-p
-                        e-avatar e-name e-topic e-latest e-members
-                        e-session))))
+    (when leman-tabulated-room-list-simplify-timestamps
+      (setf e-latest (replace-regexp-in-string
+                      (rx bos (1+ digit) (1+ alpha) (group (1+ (1+ digit) (1+ alpha))))
+                      "" e-latest t t 1)))
+    ;; Prefix the topic to show the room's status.
+    (pcase (leman-room-status room)
+      ('invite
+       (setf e-topic (concat (propertize "[invited]"
+                                         'face 'leman-tabulated-room-list-invited)
+                             " " e-topic)))
+      ('leave
+       (setf e-topic (concat (propertize "[left]"
+                                         'face 'leman-tabulated-room-list-left)
+                             " " e-topic))))
+    (list room (vector e-unread e-priority e-buffer e-direct-p
+                       e-avatar e-name e-topic e-latest e-members
+                       e-session))))
 ;; TODO: Define sorters with a macro?  This gets repetitive and hard to update.
 
 (defun leman-tabulated-room-list-members< (a b)
