@@ -1560,6 +1560,60 @@ Works in major-modes `leman-room-mode',
           (string (setf tag (intern tag))))
         (assoc tag tags)))))
 
+(defun leman--timeline-unread-p (timeline receipts fully-read-event-id our-id)
+  "Return non-nil if room TIMELINE is unread for user OUR-ID.
+RECEIPTS is the room's hash table of read receipts, and
+FULLY-READ-EVENT-ID the event ID of the room's fully-read marker
+event, if known."
+  ;; NOTE: This is *WAY* too complicated, but it seems roughly equivalent to doesRoomHaveUnreadMessages() from
+  ;; <https://github.com/matrix-org/matrix-react-sdk/blob/7fa01ffb068f014506041bce5f02df4f17305f02/src/Unread.ts#L52>.
+  (when timeline
+    ;; A room should rarely, if ever, have a nil timeline, but in case it does
+    ;; (which apparently can happen, given user reports), it should not be
+    ;; considered unread.
+    (cl-labels ((event-counts-toward-unread-p (event)
+                  ;; NOTE: We only consider message events, so membership, reaction,
+                  ;; etc. events will not mark a room as unread.  Ideally, I think
+                  ;; that join/leave events should, at least optionally, mark a room
+                  ;; as unread (e.g. in a 1:1 room with a friend, if the other user
+                  ;; left, one would probably want to know, and marking the room
+                  ;; unread would help the user notice), but since membership events
+                  ;; have to be processed to understand their meaning, it's not
+                  ;; straightforward to know whether one should mark a room unread.
+
+                  ;; FIXME: Use code from `leman-room--format-member-event' to
+                  ;; distinguish ones that should count.
+                  (equal "m.room.message" (leman-event-type event))))
+      (let ((our-read-receipt-event-id (car (gethash our-id receipts)))
+            (first-counting-event (cl-find-if #'event-counts-toward-unread-p timeline)))
+        (cond ((equal fully-read-event-id (leman-event-id (car timeline)))
+               ;; The fully-read marker is at the last known event: the room is read.
+               nil)
+              ((and (not our-read-receipt-event-id)
+                    (when first-counting-event
+                      (and (not (equal fully-read-event-id (leman-event-id first-counting-event)))
+                           (not (equal our-id (leman-user-id (leman-event-sender first-counting-event)))))))
+               ;; The room has no read receipt, and the latest message event is not
+               ;; the event at which our fully-read marker is at, and it is not sent
+               ;; by us: the room is unread.  (This is a kind of failsafe to ensure
+               ;; the user doesn't miss any messages, but it's unclear whether this
+               ;; is really correct or best.)
+               t)
+              ((equal our-id (leman-user-id (leman-event-sender (car timeline))))
+               ;; We sent the last event: the room is read.
+               nil)
+              ((and first-counting-event
+                    (equal our-id (leman-user-id (leman-event-sender first-counting-event))))
+               ;; We sent the last message event: the room is read.
+               nil)
+              ((cl-loop for event in timeline
+                        when (event-counts-toward-unread-p event)
+                        return (and (not (equal our-read-receipt-event-id (leman-event-id event)))
+                                    (not (equal fully-read-event-id (leman-event-id event)))))
+               ;; The latest message event is not the event at which our
+               ;; read-receipt or fully-read marker are at: the room is unread.
+               t))))))
+
 (defun leman--room-unread-p (room session)
   "Return non-nil if ROOM is considered unread for SESSION.
 The room is unread if it has a modified, live buffer; if it has
@@ -1582,55 +1636,8 @@ is not at the latest known message event."
         (and unread-notifications
              (or (not (zerop notification_count))
                  (not (zerop highlight_count))))
-        ;; NOTE: This is *WAY* too complicated, but it seems roughly equivalent to doesRoomHaveUnreadMessages() from
-        ;; <https://github.com/matrix-org/matrix-react-sdk/blob/7fa01ffb068f014506041bce5f02df4f17305f02/src/Unread.ts#L52>.
-        (when (and (not leman-room-unread-only-counts-notifications)
-                   timeline)
-          ;; A room should rarely, if ever, have a nil timeline, but in case it does
-          ;; (which apparently can happen, given user reports), it should not be
-          ;; considered unread.
-          (cl-labels ((event-counts-toward-unread-p (event)
-                        ;; NOTE: We only consider message events, so membership, reaction,
-                        ;; etc. events will not mark a room as unread.  Ideally, I think
-                        ;; that join/leave events should, at least optionally, mark a room
-                        ;; as unread (e.g. in a 1:1 room with a friend, if the other user
-                        ;; left, one would probably want to know, and marking the room
-                        ;; unread would help the user notice), but since membership events
-                        ;; have to be processed to understand their meaning, it's not
-                        ;; straightforward to know whether one should mark a room unread.
-
-                        ;; FIXME: Use code from `leman-room--format-member-event' to
-                        ;; distinguish ones that should count.
-                        (equal "m.room.message" (leman-event-type event))))
-            (let ((our-read-receipt-event-id (car (gethash our-id receipts)))
-                  (first-counting-event (cl-find-if #'event-counts-toward-unread-p timeline)))
-              (cond ((equal fully-read-event-id (leman-event-id (car timeline)))
-                     ;; The fully-read marker is at the last known event: the room is read.
-                     nil)
-                    ((and (not our-read-receipt-event-id)
-                          (when first-counting-event
-                            (and (not (equal fully-read-event-id (leman-event-id first-counting-event)))
-                                 (not (equal our-id (leman-user-id (leman-event-sender first-counting-event)))))))
-                     ;; The room has no read receipt, and the latest message event is not
-                     ;; the event at which our fully-read marker is at, and it is not sent
-                     ;; by us: the room is unread.  (This is a kind of failsafe to ensure
-                     ;; the user doesn't miss any messages, but it's unclear whether this
-                     ;; is really correct or best.)
-                     t)
-                    ((equal our-id (leman-user-id (leman-event-sender (car timeline))))
-                     ;; We sent the last event: the room is read.
-                     nil)
-                    ((and first-counting-event
-                          (equal our-id (leman-user-id (leman-event-sender first-counting-event))))
-                     ;; We sent the last message event: the room is read.
-                     nil)
-                    ((cl-loop for event in timeline
-                              when (event-counts-toward-unread-p event)
-                              return (and (not (equal our-read-receipt-event-id (leman-event-id event)))
-                                          (not (equal fully-read-event-id (leman-event-id event)))))
-                     ;; The latest message event is not the event at which our
-                     ;; read-receipt or fully-read marker are at: the room is unread.
-                     t))))))))
+        (and (not leman-room-unread-only-counts-notifications)
+             (leman--timeline-unread-p timeline receipts fully-read-event-id our-id)))))
 
 (defun leman--update-transaction-id (session)
   "Return SESSION's incremented transaction ID formatted for sending.
