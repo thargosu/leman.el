@@ -1453,6 +1453,31 @@ shr.el used the `variable-pitch' face directly.")
         (plist-put body-face :foreground prism-color)
       body-face)))
 
+(defun leman-room--user-named (member-name buffer room)
+  "Return the user in ROOM whose displayname is MEMBER-NAME.
+Searches the events visible in ROOM's BUFFER for a sender whose
+displayname in ROOM matches MEMBER-NAME.  Returns nil if no such
+sender is found."
+  ;; HACK: Since we don't currently keep a list of all members in a
+  ;; room, we look to see if this displayname has any mentions in the
+  ;; room so far.
+  (save-match-data
+    (with-current-buffer buffer
+      (save-excursion
+        (goto-char (point-min))
+        (cl-labels ((found-sender-p (ewoc-data)
+                      (when (leman-event-p ewoc-data)
+                        (equal member-name
+                               (gethash (leman-event-sender ewoc-data) (leman-room-displaynames room))))))
+          (cl-loop with regexp = (regexp-quote member-name)
+                   while (re-search-forward regexp nil t)
+                   ;; NOTE: I don't know why, but sometimes the regexp
+                   ;; search ends on a non-event line, like a timestamp
+                   ;; header, so for now we just try to handle that case.
+                   for maybe-event = (ewoc-data (ewoc-locate leman-ewoc))
+                   when (found-sender-p maybe-event)
+                   return (leman-event-sender maybe-event)))))))
+
 (defun leman-room--add-member-face (string room)
   "Add member faces in ROOM to STRING.
 If STRING begins with the name of a member in ROOM followed by a
@@ -1476,25 +1501,7 @@ Note that, if ROOM has no buffer, STRING is returned unchanged."
           ;; FIXME: Member names containing spaces aren't matched.  Can this even be fixed reasonably?
           (when (string-match (rx bos (group (1+ (not blank))) (or ":" ",") (1+ blank)) string)
             (when-let* ((member-name (match-string 1 string))
-                        ;; HACK: Since we don't currently keep a list of all
-                        ;; members in a room, we look to see if this displayname
-                        ;; has any mentions in the room so far.
-                        (user (save-match-data
-                                (with-current-buffer buffer
-                                  (save-excursion
-                                    (goto-char (point-min))
-                                    (cl-labels ((found-sender-p (ewoc-data)
-                                                  (when (leman-event-p ewoc-data)
-                                                    (equal member-name
-                                                           (gethash (leman-event-sender ewoc-data) (leman-room-displaynames room))))))
-                                      (cl-loop with regexp = (regexp-quote member-name)
-                                               while (re-search-forward regexp nil t)
-                                               ;; NOTE: I don't know why, but sometimes the regexp
-                                               ;; search ends on a non-event line, like a timestamp
-                                               ;; header, so for now we just try to handle that case.
-                                               for maybe-event = (ewoc-data (ewoc-locate leman-ewoc))
-                                               when (found-sender-p maybe-event)
-                                               return (leman-event-sender maybe-event)))))))
+                        (user (leman-room--user-named member-name buffer room))
                         (prism-color (or (leman-user-color user)
                                          (setf (leman-user-color user)
                                                (leman-room--user-color user)))))
