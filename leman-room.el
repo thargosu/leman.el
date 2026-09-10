@@ -3743,6 +3743,33 @@ Return absorbing node if coalesced."
           (ewoc-invalidate ewoc absorbing-node)
           absorbing-node)))))
 
+(defun leman-room--timestamped-node-p (data)
+  "Return non-nil if ewoc node datum DATA has a timestamp."
+  (pcase data
+    ((pred leman-event-p) t)
+    ((pred leman-room-membership-events-p) t)
+    (`(ts . ,_) t)))
+
+(defun leman-room--read-marker-node-p (data)
+  "Return non-nil if ewoc node datum DATA is a read marker."
+  (member data '(leman-room-fully-read-marker
+                 leman-room-read-receipt-marker)))
+
+(defun leman-room--node-ts (data)
+  "Return the timestamp of ewoc node datum DATA in milliseconds."
+  (pcase data
+    ((pred leman-event-p) (leman-event-origin-server-ts data))
+    ((pred leman-room-membership-events-p)
+     ;; Not sure whether to use earliest or latest ts; let's try this for now.
+     (leman-room-membership-events-earliest-ts data))
+    (`(ts ,ts)
+     ;; Matrix server timestamps are in ms, so we must convert back.
+     (* 1000 ts))))
+
+(defun leman-room--node-ts< (a b)
+  "Return non-nil if ewoc node datum A's timestamp is before B's."
+  (< (leman-room--node-ts a) (leman-room--node-ts b)))
+
 (defun leman-room--insert-event (event)
   "Insert EVENT into current buffer."
   (cl-labels ((format-event (event)
@@ -3753,60 +3780,35 @@ Return absorbing node if coalesced."
                         (leman-user-id (leman-event-sender event))
                         (when (alist-get 'body (leman-event-content event))
                           (substring-no-properties
-                           (truncate-string-to-width (alist-get 'body (leman-event-content event)) 20)))))
-              (find-node-if (ewoc pred &key (move #'ewoc-prev) (start (ewoc-nth ewoc -1)))
-                "Return node in EWOC whose data matches PRED.
-Search starts from node START and moves by NEXT."
-                (cl-loop for node = start then (funcall move ewoc node)
-                         while node
-                         when (funcall pred (ewoc-data node))
-                         return node))
-              (timestamped-node-p (data)
-                (pcase data
-                  ((pred leman-event-p) t)
-                  ((pred leman-room-membership-events-p) t)
-                  (`(ts . ,_) t)))
-              (read-marker-p
-                (data) (member data '(leman-room-fully-read-marker
-                                      leman-room-read-receipt-marker)))
-              (node-ts (data)
-                (pcase data
-                  ((pred leman-event-p) (leman-event-origin-server-ts data))
-                  ((pred leman-room-membership-events-p)
-                   ;; Not sure whether to use earliest or latest ts; let's try this for now.
-                   (leman-room-membership-events-earliest-ts data))
-                  (`(ts ,ts)
-                   ;; Matrix server timestamps are in ms, so we must convert back.
-                   (* 1000 ts))))
-              (node< (a b)
-                "Return non-nil if event A's timestamp is before B's."
-                (< (node-ts a) (node-ts b))))
+                           (truncate-string-to-width (alist-get 'body (leman-event-content event)) 20))))))
     (leman-debug "INSERTING NEW EVENT: " (format-event event))
     (let* ((ewoc leman-ewoc)
-           (event-node-before (leman-room--ewoc-node-before ewoc event #'node< :pred #'timestamped-node-p))
+           (event-node-before (leman-room--ewoc-node-before ewoc event #'leman-room--node-ts< :pred #'leman-room--timestamped-node-p))
            new-node)
       ;; HACK: Insert after any read markers.
       (cl-loop for node-after-node-before = (ewoc-next ewoc event-node-before)
                while node-after-node-before
-               while (read-marker-p (ewoc-data node-after-node-before))
+               while (leman-room--read-marker-node-p (ewoc-data node-after-node-before))
                do (setf event-node-before node-after-node-before))
       (setf new-node (if (not event-node-before)
-                         (progn
-                           (leman-debug "No event before it: add first.")
-                           (if-let ((first-node (ewoc-nth ewoc 0)))
-                               (progn
-                                 (leman-debug "EWOC not empty.")
-                                 (if (and (leman-user-p (ewoc-data first-node))
-                                          (equal (leman-event-sender event)
-                                                 (ewoc-data first-node)))
-                                     (progn
-                                       (leman-debug "First node is header for this sender: insert after it, instead.")
-                                       (setf event-node-before first-node)
-                                       (ewoc-enter-after ewoc first-node event))
-                                   (leman-debug "First node is not header for this sender: insert first.")
-                                   (ewoc-enter-first ewoc event)))
-                             (leman-debug "EWOC empty: add first.")
-                             (ewoc-enter-first ewoc event)))
+                         (let ((first-node (ewoc-nth ewoc 0)))
+                           (cond ((not first-node)
+                                  (leman-debug "No event before it: add first.")
+                                  (leman-debug "EWOC empty: add first.")
+                                  (ewoc-enter-first ewoc event))
+                                 ((and (leman-user-p (ewoc-data first-node))
+                                       (equal (leman-event-sender event)
+                                              (ewoc-data first-node)))
+                                  (leman-debug "No event before it: add first.")
+                                  (leman-debug "EWOC not empty.")
+                                  (leman-debug "First node is header for this sender: insert after it, instead.")
+                                  (setf event-node-before first-node)
+                                  (ewoc-enter-after ewoc first-node event))
+                                 (t
+                                  (leman-debug "No event before it: add first.")
+                                  (leman-debug "EWOC not empty.")
+                                  (leman-debug "First node is not header for this sender: insert first.")
+                                  (ewoc-enter-first ewoc event))))
                        (leman-debug "Found event before new event: insert after it.")
                        (when-let ((next-node (ewoc-next ewoc event-node-before)))
                          (when (and (leman-user-p (ewoc-data next-node))
