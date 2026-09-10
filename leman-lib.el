@@ -512,14 +512,19 @@ otherwise use current room."
                 (propertize (or string "") 'face 'font-lock-builtin-face))
               (id (string)
                 (propertize (or string "") 'face 'font-lock-constant-face))
-              (member<
-                (a b) (string-collate-lessp (car a) (car b) nil t)))
+              (member< (a b)
+                (string-collate-lessp (car a) (car b) nil t))
+              (format-ts (ts)
+                (format-time-string "%Y-%m-%d %H:%M:%S" (/ ts 1000))))
     (pcase-let* (((cl-struct leman-room (id room-id) avatar display-name canonical-alias members timeline status topic
                              (local (map fetched-members-p)))
                   room)
                  ((cl-struct leman-session user) session)
                  ((cl-struct leman-user (id user-id)) user)
-                 (inhibit-read-only t))
+                 (earliest-ts (cl-loop for event in timeline
+                                       minimize (leman-event-origin-server-ts event)))
+                 (latest-ts (cl-loop for event in timeline
+                                     maximize (leman-event-origin-server-ts event))))
       (if (not fetched-members-p)
           ;; Members not fetched: fetch them and re-call this command.
           (leman--get-joined-members room session
@@ -561,16 +566,8 @@ otherwise use current room."
                         (heading "Alias: ") "<" (id canonical-alias) ">" "\n\n"
                         (heading "Topic: ") (propertize (or topic "[none]") 'face 'font-lock-comment-face) "\n\n"
                         (heading "Retrieved events: ") (number-to-string (length timeline)) "\n"
-                        (heading "  spanning: ")
-                        (format-time-string "%Y-%m-%d %H:%M:%S"
-                                            (/ (leman-event-origin-server-ts
-                                                (car (cl-sort (copy-sequence timeline) #'< :key #'leman-event-origin-server-ts)))
-                                               1000))
-                        (heading " to ")
-                        (format-time-string "%Y-%m-%d %H:%M:%S\n\n"
-                                            (/ (leman-event-origin-server-ts
-                                                (car (cl-sort (copy-sequence timeline) #'> :key #'leman-event-origin-server-ts)))
-                                               1000))
+                        (heading "  spanning: ") (format-ts earliest-ts)
+                        (heading " to ") (format-ts latest-ts) "\n\n"
                         (heading "Members") " (" (number-to-string (hash-table-count members)) "):\n")
                 (pcase-dolist (`(,formatted . ,id) member-pairs)
                   (insert "  " (format spec id formatted) "\n")))))
