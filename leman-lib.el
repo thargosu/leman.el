@@ -55,6 +55,8 @@
 (defvar leman-ewoc)
 (defvar leman-room)
 (defvar leman-session)
+;; Optional dependency: registered with in `leman--annotate-room', etc.
+(defvar marginalia-annotator-registry)
 
 (defvar leman-room-buffer-name-prefix)
 (defvar leman-room-buffer-name-suffix)
@@ -786,13 +788,72 @@ THEN and ELSE are passed to `leman-api', which see."
     :content-type content-type :data data :data-type 'binary
     :then then :else else))
 
+(defface leman-completion-annotation
+  '((t :inherit shadow))
+  "Face for Marginalia annotations of Leman completion candidates."
+  :group 'leman)
+
+(defun leman--completion-table (category collection)
+  "Return a completion table for COLLECTION with metadata CATEGORY.
+Wrapping plain collections in a table with a category allows
+Marginalia to annotate candidates (see
+`leman--annotate-room', for example)."
+  (lambda (string pred action)
+    (if (eq action 'metadata)
+        `(metadata (category . ,category))
+      (complete-with-action action collection string pred))))
+
+(defun leman--room-from-candidate (cand)
+  "Return the room referred to by formatted candidate string CAND.
+CAND is a string formatted by `leman--format-room', which embeds
+the room's ID; the room is looked up by that ID in all sessions."
+  (when (string-match "(<\\(![^)>]*\\)>)" cand)
+    (cl-loop for (_id . session) in leman-sessions
+             for room = (cl-find (match-string 1 cand)
+                                 (leman-session-rooms session)
+                                 :key #'leman-room-id :test #'equal)
+             when room
+             return room)))
+
+(defun leman--annotate-room (cand)
+  "Return a Marginalia annotation for room candidate CAND."
+  (when-let* ((room (leman--room-from-candidate cand)))
+    (format "%s"
+            (propertize
+             (concat
+              (format " %d members" (hash-table-count (leman-room-members room)))
+              (when-let* ((notifications (leman-room-unread-notifications room))
+                          (count (map-elt notifications 'notification_count 0))
+                          ((> count 0)))
+                (format " • %d unread" count))
+              (when-let* ((notifications (leman-room-unread-notifications room))
+                          (count (map-elt notifications 'highlight_count 0))
+                          ((> count 0)))
+                (format " • %d mention%s" count (if (= count 1) "" "s"))))
+             'face 'leman-completion-annotation))))
+
+(defun leman--annotate-session (cand)
+  "Return a Marginalia annotation for session candidate CAND."
+  (when-let* ((session (alist-get cand leman-sessions nil nil #'equal)))
+    (format "%s"
+            (propertize
+             (format " %s %s"
+                     (if (leman-session-token session)
+                         "connected to" "not connected to")
+                     (leman-session-server session))
+             'face 'leman-completion-annotation))))
+
+(with-eval-after-load 'marginalia
+  (add-to-list 'marginalia-annotator-registry '(leman-room leman--annotate-room))
+  (add-to-list 'marginalia-annotator-registry '(leman-session leman--annotate-session)))
+
 (cl-defun leman-complete-session (&key (prompt "Session: "))
   "Return an Leman session selected with completion."
   (pcase (length leman-sessions)
     (0 (user-error "No active sessions.  Call `leman-connect' to log in"))
     (1 (cdar leman-sessions))
     (_ (let* ((ids (mapcar #'car leman-sessions))
-              (selected-id (completing-read prompt ids nil t)))
+              (selected-id (completing-read prompt (leman--completion-table 'leman-session ids) nil t)))
          (alist-get selected-id leman-sessions nil nil #'equal)))))
 
 (declare-function ewoc-locate "ewoc")
@@ -817,8 +878,8 @@ unseen user IDs to be input as well."
                             (when-let ((node (ewoc-locate leman-ewoc)))
                               (when (leman-event-p (ewoc-data node))
                                 (format-user (leman-event-sender (ewoc-data node)))))))
-	   (selected-user (completing-read "User: " (mapcar #'car display-to-id)
-                                           nil nil user-at-point)))
+	   (selected-user (completing-read "User: " (leman--completion-table 'leman-user (mapcar #'car display-to-id))
+                                            nil nil user-at-point)))
       (or (alist-get selected-user display-to-id nil nil #'equal)
 	  selected-user))))
 
@@ -1123,8 +1184,8 @@ suggested room."
                                          collect (cons (leman--format-room room 'topic)
                                                        (list room session)))))
                (names (mapcar #'car name-to-room-session))
-               (selected-name (completing-read
-                               prompt names nil t
+                (selected-name (completing-read
+                                prompt (leman--completion-table 'leman-room names) nil t
                                (when suggest
                                  (when-let ((suggestion (leman--room-at-point)))
                                    (when (or (not predicate)
