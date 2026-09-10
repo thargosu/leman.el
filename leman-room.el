@@ -121,6 +121,7 @@ Should be used to, e.g. propagate variables to the minibuffer.")
 Used to, e.g. call `leman-room-compose-org'.")
 
 (declare-function leman-room-list "leman-room-list.el")
+(declare-function leman-view-space "leman-directory")
 (declare-function leman-notify-switch-to-mentions-buffer "leman-notify")
 (declare-function leman-notify-switch-to-notifications-buffer "leman-notify")
 
@@ -2760,11 +2761,65 @@ see."
       (read-from-minibuffer prompt initial-input leman-room-minibuffer-map
                             nil history default-value inherit-input-method))))
 
+(defun leman-room--encrypted-p (room)
+  "Return non-nil if ROOM's state or invite state indicates encryption."
+  (cl-loop for state in (list (leman-room-state room)
+                              (leman-room-invite-state room))
+           thereis (cl-find "m.room.encryption" state
+                            :test #'equal :key #'leman-event-type)))
+
+(defun leman-room--button (label action)
+  "Return LABEL propertized as a button which calls ACTION."
+  (propertize label
+              'button '(t)
+              'category 'default-button
+              'mouse-face 'highlight
+              'follow-link t
+              'action action))
+
+(defun leman-room--initial-header (room)
+  "Return initial header string for ROOM's buffer."
+  (if (leman-room--encrypted-p room)
+      (propertize "This appears to be an encrypted room, which is not natively supported by Leman.el.  (See information about using Pantalaimon in Leman.el documentation.)"
+                  'face 'font-lock-warning-face)
+    ""))
+
+(defun leman-room--initial-footer (room)
+  "Return initial footer string for ROOM's buffer."
+  (pcase (leman-room-status room)
+    ;; Set header and footer for an invited room.
+    ('invite
+     (concat (propertize "You've been invited to this room.  "
+                         'face 'font-lock-warning-face)
+             (leman-room--button
+              "[Join this room]"
+              (lambda (_button)
+                ;; Kill the room buffer so it can be recreated after joining
+                ;; (which will cleanly update the room's name, footer, etc).
+                (let ((room leman-room)
+                      (session leman-session))
+                  (kill-buffer)
+                  (message "Joining room... (buffer will be reopened after joining)")
+                  (leman-room-join (leman-room-id room) session))))))
+    (_ (if (leman--space-p room)
+           (concat (propertize "This room is a space.  It is not for messaging, but only a grouping of other rooms.  "
+                               'face 'font-lock-type-face)
+                   (leman-room--button
+                    "[View rooms in this space]"
+                    (lambda (_button)
+                      ;; Kill the room buffer so it can be recreated after viewing
+                      ;; (which will cleanly update the room's name, footer, etc).
+                      (let ((room leman-room)
+                            (session leman-session))
+                        (kill-buffer)
+                        (message "Viewing space...")
+                        (leman-view-space room session)))))
+         ""))))
+
 (defun leman-room--buffer (session room name)
   "Return buffer named NAME showing ROOM's events on SESSION.
 If ROOM has no buffer, one is made and stored in the room's local
 data slot."
-  (declare (function leman-view-space "leman-directory"))
   (or (map-elt (leman-room-local room) 'buffer)
       (let ((new-buffer (generate-new-buffer name)))
         (with-current-buffer new-buffer
@@ -2775,7 +2830,7 @@ data slot."
                 leman-room room
                 list-buffers-directory (or (leman-room-canonical-alias room)
                                            (leman-room-id room))
-                ;; Track buffer in room's slot.
+                ;; Track buffer in room's local slot.
                 (map-elt (leman-room-local room) 'buffer) (current-buffer))
           (add-hook 'kill-buffer-hook
                     (lambda ()
@@ -2784,56 +2839,10 @@ data slot."
           (setq-local bookmark-make-record-function #'leman-room-bookmark-make-record)
           ;; Set initial header and footer.  (Do this before processing events, which
           ;; might cause the header/footer to be changed (e.g. a tombstone event).
-          (let ((header (if (cl-loop for state in (list (leman-room-state leman-room)
-                                                        (leman-room-invite-state leman-room))
-                                     thereis (cl-find "m.room.encryption" state
-                                                      :test #'equal :key #'leman-event-type))
-                            (propertize "This appears to be an encrypted room, which is not natively supported by Leman.el.  (See information about using Pantalaimon in Leman.el documentation.)"
-                                        'face 'font-lock-warning-face)
-                          ""))
-                (footer (pcase (leman-room-status leman-room)
-                          ;; Set header and footer for an invited room.
-                          ('invite
-                           (concat (propertize "You've been invited to this room.  "
-                                               'face 'font-lock-warning-face)
-                                   (propertize "[Join this room]"
-                                               'button '(t)
-                                               'category 'default-button
-                                               'mouse-face 'highlight
-                                               'follow-link t
-                                               'action (lambda (_button)
-                                                         ;; Kill the room buffer so it can be recreated after joining
-                                                         ;; (which will cleanly update the room's name, footer, etc).
-                                                         (let ((room leman-room)
-                                                               (session leman-session))
-                                                           (kill-buffer)
-                                                           (message "Joining room... (buffer will be reopened after joining)")
-                                                           (leman-room-join (leman-room-id room) session))))))
-                          (_ (if (leman--space-p room)
-                                 (concat (propertize "This room is a space.  It is not for messaging, but only a grouping of other rooms.  "
-                                                     'face 'font-lock-type-face)
-                                         (propertize "[View rooms in this space]"
-                                                     'button '(t)
-                                                     'category 'default-button
-                                                     'mouse-face 'highlight
-                                                     'follow-link t
-                                                     'action (lambda (_button)
-                                                               ;; Kill the room buffer so it can be recreated after joining
-                                                               ;; (which will cleanly update the room's name, footer, etc).
-                                                               (let ((room leman-room)
-                                                                     (session leman-session))
-                                                                 (kill-buffer)
-                                                                 (message "Viewing space...")
-                                                                 (leman-view-space room session)))))
-                               "")))))
-            (ewoc-set-hf leman-ewoc header footer))
-          (setf
-           ;; Clear new-events, because those only matter when a buffer is already open.
-           (alist-get 'new-events (leman-room-local room)) nil
-           ;; Set the new buffer in the room's local alist so that it
-           ;; can be used by event-inserting functions before this
-           ;; function returns, e.g. `leman-room--add-member-face'.
-           (alist-get 'buffer (leman-room-local room)) new-buffer)
+          (ewoc-set-hf leman-ewoc (leman-room--initial-header room)
+                                   (leman-room--initial-footer room))
+          ;; Clear new-events, because those only matter when a buffer is already open.
+          (setf (alist-get 'new-events (leman-room-local room)) nil)
           ;; We don't use `leman-room--insert-events' to avoid extra
           ;; calls to `leman-room--insert-ts-headers'.
           ;; NOTE: We handle the events in chronological order (i.e. the reverse of the
@@ -5141,6 +5150,30 @@ See `leman-room-compose-history-isearch-push-state'."
 
 ;; NOTE: Widgets are only currently used for single membership events, not grouped ones.
 
+(defun leman-room--pair-events (events others)
+  "Pair each event in EVENTS with one in OTHERS by state-key.
+Return a list of three lists: the paired OTHERS events, the
+EVENTS that had no pair, and the OTHERS that had no pair.  Each
+OTHERS event is paired at most once; once an OTHERS event has
+been paired, its state-key is consumed, so other OTHERS and
+EVENTS events having that state-key are dropped."
+  (let ((paired-others nil)
+        (remaining-events nil)
+        (remaining-others (copy-sequence others))
+        (paired-state-keys nil))
+    (dolist (event events)
+      (let ((state-key (leman-event-state-key event))
+            (other (cl-find (leman-event-state-key event) remaining-others
+                            :test #'equal :key #'leman-event-state-key)))
+        (cond (other
+               (push other paired-others)
+               (push state-key paired-state-keys)
+               (setf remaining-others (cl-delete state-key remaining-others
+                                                 :test #'equal :key #'leman-event-state-key)))
+              ((not (member state-key paired-state-keys))
+               (push event remaining-events)))))
+    (list (nreverse paired-others) (nreverse remaining-events) remaining-others)))
+
 (defun leman-room--format-membership-events (struct room)
   "Return string for STRUCT in ROOM.
 STRUCT should be an `leman-room-membership-events' struct."
@@ -5153,123 +5186,97 @@ STRUCT should be an `leman-room-membership-events' struct."
               (old-membership (event)
                 (map-nested-elt (leman-event-unsigned event) '(prev_content membership)))
               (new-membership (event)
-                (alist-get 'membership (leman-event-content event))))
+                (alist-get 'membership (leman-event-content event)))
+              (avatar-url-changed-p (event)
+                (not (equal (alist-get 'avatar_url (leman-event-content event))
+                            (map-nested-elt (leman-event-unsigned event)
+                                            '(prev_content avatar_url)))))
+              (kicked-p (event)
+                ;; Kicked by another user, rather than leaving on their own.
+                (and (equal "join" (old-membership event))
+                     (equal "leave" (new-membership event))
+                     (not (equal (leman-user-id (leman-event-sender event))
+                                 (leman-event-state-key event)))))
+              (classify (event)
+                ;; Return the summary type for EVENT's membership change, or nil when
+                ;; the event should not be shown in the summary.
+                (let ((old (old-membership event))
+                      (new (new-membership event)))
+                  (cond ((equal new "join")
+                         (cond ((equal old "join")
+                                (if (avatar-url-changed-p event)
+                                    "changed avatar"
+                                  "changed name"))
+                               ((equal old "leave") "rejoined")
+                               (t "joined")))
+                        ((equal new "leave")
+                         (cond ((equal old "ban") "unbanned")
+                               ((equal old "invite") "rejected invitation")
+                               (t "left")))
+                        ((equal new "invite") "invited")
+                        ((equal new "ban")
+                         (cond ((equal old "join") "kicked and banned")
+                               ((member old '("invite" "leave")) "banned"))))))
+              (state-key-in (events)
+                (lambda (event)
+                  (cl-find (leman-event-state-key event) events
+                           :test #'equal :key #'leman-event-state-key))))
     (pcase-let* (((cl-struct leman-room-membership-events events) struct))
       (pcase (length events)
         (0 (warn "No events in `leman-room-membership-events' struct"))
         (1 (leman-room--format-member-event (car events) room))
-        (_ (let* ((left-events (cl-remove-if-not (lambda (event)
-                                                   (and (equal "leave" (new-membership event))
-                                                        (not (member (old-membership event) '("ban" "invite")))))
-                                                 events))
-                  (join-events (cl-remove-if-not (lambda (event)
-                                                   (and (equal "join" (new-membership event))
-                                                        (not (equal "join" (old-membership event)))))
-                                                 events))
-                  (rejoin-events (cl-remove-if-not (lambda (event)
-                                                     (and (equal "join" (new-membership event))
-                                                          (equal "leave" (old-membership event))))
-                                                   events))
-                  (invite-events (cl-remove-if-not (lambda (event)
-                                                     (equal "invite" (new-membership event)))
-                                                   events))
-                  (reject-events (cl-remove-if-not (lambda (event)
-                                                     (and (equal "invite" (old-membership event))
-                                                          (equal "leave" (new-membership event))))
-                                                   events))
-                  (ban-events (cl-remove-if-not (lambda (event)
-                                                  (and (member (old-membership event) '("invite" "leave"))
-                                                       (equal "ban" (new-membership event))))
-                                                events))
-                  (unban-events (cl-remove-if-not (lambda (event)
-                                                    (and (equal "ban" (old-membership event))
-                                                         (equal "leave" (new-membership event))))
-                                                  events))
-                  (kicked-events (cl-remove-if-not (lambda (event)
-                                                     (and (equal "join" (old-membership event))
-                                                          (equal "leave" (new-membership event))
-                                                          (not (equal (leman-user-id (leman-event-sender event))
-                                                                      (leman-event-state-key event)))))
-                                                   events))
-                  (kick-and-ban-events (cl-remove-if-not (lambda (event)
-                                                           (and (equal "join" (old-membership event))
-                                                                (equal "ban" (new-membership event))))
-                                                         events))
-                  (rename-events (cl-remove-if-not (lambda (event)
-                                                     (and (equal "join" (old-membership event))
-                                                          (equal "join" (new-membership event))
-                                                          (equal (alist-get 'avatar_url (leman-event-content event))
-                                                                 (map-nested-elt (leman-event-unsigned event)
-                                                                                 '(prev_content avatar_url)))))
-                                                   events))
-                  (avatar-events (cl-remove-if-not (lambda (event)
-                                                     (and (equal "join" (old-membership event))
-                                                          (equal "join" (new-membership event))
-                                                          (not (equal (alist-get 'avatar_url (leman-event-content event))
-                                                                      (map-nested-elt (leman-event-unsigned event)
-                                                                                      '(prev_content avatar_url))))))
-                                                   events))
-                  join-and-leave-events rejoin-and-leave-events kicked-and-rejoined-events)
-             ;; Remove apparent duplicates between join/rejoin events.
-             (setf join-events (cl-delete-if (lambda (event)
-                                               (cl-find (leman-event-state-key event) rejoin-events
-                                                        :test #'equal :key #'leman-event-state-key))
-                                             join-events)
-                   rejoin-events (cl-delete-if (lambda (event)
-                                                 (cl-find (leman-event-state-key event) join-events
-                                                          :test #'equal :key #'leman-event-state-key))
-                                               rejoin-events)
-                   join-and-leave-events (cl-loop for join-event in join-events
-                                                  for left-event = (cl-find (leman-event-state-key join-event) left-events
-                                                                            :test #'equal :key #'leman-event-state-key)
-                                                  when left-event
-                                                  collect left-event
-                                                  and do (setf join-events (cl-delete (leman-event-state-key join-event) join-events
-                                                                                      :test #'equal :key #'leman-event-state-key)
-                                                               left-events (cl-delete (leman-event-state-key left-event) left-events
-                                                                                      :test #'equal :key #'leman-event-state-key)))
-                   kicked-and-rejoined-events (cl-loop for rejoin-event in rejoin-events
-                                                       for kicked-event = (cl-find (leman-event-state-key rejoin-event) kicked-events
-                                                                                   :test #'equal :key #'leman-event-state-key)
-                                                       when kicked-event collect kicked-event
-                                                       and do (setf rejoin-events (cl-delete (leman-event-state-key kicked-event) rejoin-events
-                                                                                             :test #'equal :key #'leman-event-state-key)
-                                                                    left-events (cl-delete (leman-event-state-key kicked-event) left-events
-                                                                                           :test #'equal :key #'leman-event-state-key)))
-                   rejoin-and-leave-events (cl-loop for rejoin-event in rejoin-events
-                                                    for left-event = (cl-find (leman-event-state-key rejoin-event) left-events
-                                                                              :test #'equal :key #'leman-event-state-key)
-                                                    when left-event
-                                                    collect left-event
-                                                    and do (setf rejoin-events (cl-delete
-                                                                                (leman-event-state-key rejoin-event) rejoin-events
-                                                                                :test #'equal :key #'leman-event-state-key)
-                                                                 left-events (cl-delete (leman-event-state-key left-event) left-events
-                                                                                        :test #'equal :key #'leman-event-state-key))))
-             (format "Membership: %s."
-                     (string-join (cl-loop for (type . events)
-                                           in (leman-alist "rejoined" rejoin-events
-                                                           "joined" join-events
-                                                           "left" left-events
-                                                           "joined and left" join-and-leave-events
-                                                           "was kicked and rejoined" kicked-and-rejoined-events
-                                                           "rejoined and left" rejoin-and-leave-events
-                                                           "invited" invite-events
-                                                           "rejected invitation" reject-events
-                                                           "banned" ban-events
-                                                           "unbanned" unban-events
-                                                           "kicked and banned" kick-and-ban-events
-                                                           "changed name" rename-events
-                                                           "changed avatar" avatar-events)
-                                           for users = (mapcar #'event-user
-                                                               (cl-delete-duplicates
-                                                                events :key #'leman-event-state-key))
-                                           for number = (length users)
-                                           when events
-                                           collect (format "%s %s (%s)" number
-                                                           (propertize type 'face 'bold)
-                                                           (string-join users ", ")))
-                                  "; "))))))))
+        (_ (let* ((kicked-events (cl-remove-if-not #'kicked-p events))
+                  (buckets (let (buckets)
+                             (dolist (event events)
+                               (when-let ((type (classify event)))
+                                 (push event (alist-get type buckets nil nil #'equal))))
+                             ;; The buckets were built by pushing, which
+                             ;; reverses the events' order; restore it.
+                             (cl-loop for (type . bucket-events) in buckets
+                                      collect (cons type (nreverse bucket-events)))))
+                  (rejoin-events (alist-get "rejoined" buckets nil nil #'equal))
+                  (join-events (alist-get "joined" buckets nil nil #'equal))
+                  (left-events (alist-get "left" buckets nil nil #'equal))
+                  ;; Events that are both joined and rejoined are counted as rejoined.
+                  (join-events (cl-delete-if (state-key-in rejoin-events) join-events)))
+             ;; Joins followed by a leave are counted as "joined and left".
+             (pcase-let ((`(,joined-and-left-events ,join-events ,left-events)
+                          (leman-room--pair-events join-events left-events)))
+               ;; Rejoins following a kick are counted as "was kicked and rejoined"; the
+               ;; paired kicks are also removed from the left events, in which they would
+               ;; otherwise be counted as merely leaving.
+               (pcase-let ((`(,kicked-and-rejoined-events ,rejoin-events _)
+                            (leman-room--pair-events rejoin-events kicked-events)))
+                 ;; Remaining rejoins followed by a leave are counted as "rejoined and left".
+                 (pcase-let ((`(,rejoined-and-left-events ,rejoin-events ,left-events)
+                              (leman-room--pair-events
+                               rejoin-events
+                               (cl-delete-if (state-key-in kicked-and-rejoined-events)
+                                             left-events))))
+                   (format "Membership: %s."
+                           (string-join
+                            (cl-loop for (type . events)
+                                     in (leman-alist "rejoined" rejoin-events
+                                                     "joined" join-events
+                                                     "left" left-events
+                                                     "joined and left" joined-and-left-events
+                                                     "was kicked and rejoined" kicked-and-rejoined-events
+                                                     "rejoined and left" rejoined-and-left-events
+                                                     "invited" (alist-get "invited" buckets nil nil #'equal)
+                                                     "rejected invitation" (alist-get "rejected invitation" buckets nil nil #'equal)
+                                                     "banned" (alist-get "banned" buckets nil nil #'equal)
+                                                     "unbanned" (alist-get "unbanned" buckets nil nil #'equal)
+                                                     "kicked and banned" (alist-get "kicked and banned" buckets nil nil #'equal)
+                                                     "changed name" (alist-get "changed name" buckets nil nil #'equal)
+                                                     "changed avatar" (alist-get "changed avatar" buckets nil nil #'equal))
+                                     for users = (mapcar #'event-user
+                                                         (cl-delete-duplicates
+                                                          events :key #'leman-event-state-key))
+                                     when events
+                                     collect (format "%s %s (%s)" (length users)
+                                                     (propertize type 'face 'bold)
+                                                     (string-join users ", ")))
+                            "; ")))))))))))
 
 ;;;;; Images
 

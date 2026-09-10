@@ -27,6 +27,31 @@
 (require 'map)
 
 (require 'leman-lib)
+(require 'leman-room)
+
+;; Variables from leman.el, which the tests don't load.
+(defvar leman-users)
+
+;;;; Helpers
+
+(defun leman-tests--member-event (id state-key old new &optional kicked-p avatar-differs-p)
+  "Return a membership event for testing.
+OLD and NEW are the previous and new membership strings.  KICKED-P
+means the sender differs from the state-key (i.e. another user
+did the action).  AVATAR-DIFFERS-P makes the event's new avatar
+URL differ from the previous one."
+  (make-leman-event
+   :id (format "%s-%s" id state-key)
+   :state-key state-key
+   :sender (make-leman-user :id (if kicked-p "@admin:example.com" state-key))
+   :origin-server-ts id
+   :type "m.room.member"
+   :content `((membership . ,new)
+              (avatar_url . ,(if avatar-differs-p "avatar-new" "avatar-same"))
+              (displayname . nil))
+   :unsigned `((prev_content . ((membership . ,old)
+                                (avatar_url . "avatar-same")
+                                (displayname . nil))))))
 
 ;;;; Tests
 
@@ -52,6 +77,181 @@
                    "Hello, <a href=\"https://matrix.to/#/@foo:matrix.org\">foo</a>."))
     (should (equal (leman--format-body-mentions "Hello, @foo:matrix.org, how are you?" room)
                    "Hello, <a href=\"https://matrix.to/#/@foo:matrix.org\">foo</a>, how are you?"))))
+
+(ert-deftest leman-room--pair-events ()
+  "Test pairing of membership events by state-key."
+  (let* ((join-alice (leman-tests--member-event 1 "@alice:example.com" nil "join"))
+         (join-bob (leman-tests--member-event 2 "@bob:example.com" nil "join"))
+         (leave-alice (leman-tests--member-event 3 "@alice:example.com" "join" "leave"))
+         (leave-bob (leman-tests--member-event 4 "@bob:example.com" "join" "leave"))
+         (leave-erin (leman-tests--member-event 5 "@erin:example.com" "join" "leave")))
+    ;; Paired events are returned in the events' order.
+    (should (equal (leman-room--pair-events (list join-alice join-bob)
+                                            (list leave-alice leave-bob))
+                   (list (list leave-alice leave-bob) nil nil)))
+    ;; Unpaired events remain in their respective lists.
+    (should (equal (leman-room--pair-events (list join-alice)
+                                            (list leave-bob leave-erin))
+                   (list nil (list join-alice) (list leave-bob leave-erin))))
+    ;; An OTHERS event's state-key is consumed once, so later EVENTS
+    ;; events having that state-key are dropped.
+    (let ((join-alice-again (leman-tests--member-event 6 "@alice:example.com" "invite" "join")))
+      (should (equal (leman-room--pair-events (list join-alice join-alice-again)
+                                              (list leave-alice))
+                     (list (list leave-alice) nil nil))))))
+
+(ert-deftest leman-room--format-membership-events ()
+  "Test membership events summary formatting."
+  ;; `leman-users' is declared without a value in leman-room.el (its real
+  ;; definition is in leman.el, which the tests don't load); SET it directly
+  ;; because SET is not lexically scoped, so the formatter's dynamic lookup
+  ;; will find it.
+  (set 'leman-users (make-hash-table :test #'equal))
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (leman-room room)
+         (format-summary (lambda (&rest events)
+                           (substring-no-properties
+                            (leman-room--format-membership-events
+                             (make-leman-room-membership-events :events events)
+                             room)))))
+    ;; A single event is formatted by `leman-room--format-member-event'.
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" nil "join"))
+                   "@alice:example.com joined"))
+    ;; Users are listed in events order within a category.
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" nil "join")
+                            (leman-tests--member-event 2 "@bob:example.com" nil "join")
+                            (leman-tests--member-event 3 "@carol:example.com" nil "join"))
+                   "Membership: 3 joined (@alice:example.com, @bob:example.com, @carol:example.com)."))
+    ;; Categories are listed in a fixed order.
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@carol:example.com" nil "join")
+                            (leman-tests--member-event 2 "@bob:example.com" "join" "leave")
+                            (leman-tests--member-event 3 "@alice:example.com" nil "join")
+                            (leman-tests--member-event 4 "@dave:example.com" "join" "leave"))
+                   "Membership: 2 joined (@carol:example.com, @alice:example.com); 2 left (@bob:example.com, @dave:example.com)."))
+    ;; A join followed by a leave is counted as "joined and left".
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" nil "join")
+                            (leman-tests--member-event 2 "@alice:example.com" "join" "leave"))
+                   "Membership: 1 joined and left (@alice:example.com)."))
+    ;; Events that are both joined and rejoined are counted as rejoined.
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" nil "join")
+                            (leman-tests--member-event 2 "@alice:example.com" "leave" "join"))
+                   "Membership: 1 rejoined (@alice:example.com)."))
+    ;; A kick followed by a rejoin is not also counted as leaving.
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" "join" "leave" 'kicked-p)
+                            (leman-tests--member-event 2 "@alice:example.com" "leave" "join"))
+                   "Membership: 1 was kicked and rejoined (@alice:example.com)."))
+    ;; A single kick event is formatted by `leman-room--format-member-event'.
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" "join" "leave" 'kicked-p))
+                   "@admin:example.com kicked @alice:example.com"))
+    ;; A rejoin followed by a leave.
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" "leave" "join")
+                            (leman-tests--member-event 2 "@alice:example.com" "join" "leave"))
+                   "Membership: 1 rejoined and left (@alice:example.com)."))
+    ;; Invitations.
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" "leave" "invite")
+                            (leman-tests--member-event 2 "@bob:example.com" "leave" "invite"))
+                   "Membership: 2 invited (@alice:example.com, @bob:example.com)."))
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" "invite" "leave")
+                            (leman-tests--member-event 2 "@bob:example.com" "invite" "leave"))
+                   "Membership: 2 rejected invitation (@alice:example.com, @bob:example.com)."))
+    ;; Bans and unbans.
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" "leave" "ban")
+                            (leman-tests--member-event 2 "@bob:example.com" "invite" "ban"))
+                   "Membership: 2 banned (@alice:example.com, @bob:example.com)."))
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" "ban" "leave")
+                            (leman-tests--member-event 2 "@bob:example.com" "ban" "leave"))
+                   "Membership: 2 unbanned (@alice:example.com, @bob:example.com)."))
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" "join" "ban" 'kicked-p)
+                            (leman-tests--member-event 2 "@bob:example.com" "join" "ban" 'kicked-p))
+                   "Membership: 2 kicked and banned (@alice:example.com, @bob:example.com)."))
+    ;; Ban transitions which the summary does not classify are omitted.
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" nil "ban")
+                            (leman-tests--member-event 2 "@bob:example.com" "join" "leave"))
+                   "Membership: 1 left (@bob:example.com)."))
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" "ban" "ban")
+                            (leman-tests--member-event 2 "@bob:example.com" "join" "leave"))
+                   "Membership: 1 left (@bob:example.com)."))
+    ;; Name and avatar changes.
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" "join" "join")
+                            (leman-tests--member-event 2 "@bob:example.com" "join" "join"))
+                   "Membership: 2 changed name (@alice:example.com, @bob:example.com)."))
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" "join" "join" nil 'avatar-differs-p)
+                            (leman-tests--member-event 2 "@bob:example.com" "join" "join" nil 'avatar-differs-p))
+                   "Membership: 2 changed avatar (@alice:example.com, @bob:example.com)."))
+    ;; Unclassifiable events are omitted.
+    (should (equal (funcall format-summary
+                            (leman-tests--member-event 1 "@alice:example.com" "leave" "knock")
+                            (leman-tests--member-event 2 "@bob:example.com" nil "join"))
+                   "Membership: 1 joined (@bob:example.com)."))
+    ;; The summary type is propertized with the bold face.
+    (let* ((raw (leman-room--format-membership-events
+                 (make-leman-room-membership-events
+                  :events (list (leman-tests--member-event 1 "@alice:example.com" nil "join")
+                                (leman-tests--member-event 2 "@bob:example.com" nil "join")))
+                 room))
+           (pos (string-search "joined" raw)))
+      (should (eq 'bold (get-text-property pos 'face raw))))))
+
+(ert-deftest leman-room--initial-header ()
+  "Test initial room buffer header."
+  (let ((plain (make-leman-room :id "!room:example.com"))
+        (encrypted (make-leman-room :id "!room:example.com"
+                                    :state (list (make-leman-event :type "m.room.encryption"))))
+        (encrypted-invite (make-leman-room :id "!room:example.com"
+                                           :invite-state (list (make-leman-event :type "m.room.encryption")))))
+    ;; A plain room has an empty header.
+    (should (string-empty-p (leman-room--initial-header plain)))
+    ;; An encrypted room's header warns, whether encryption is in the
+    ;; state or the invite state.
+    (should (string-search "encrypted room"
+                           (substring-no-properties (leman-room--initial-header encrypted))))
+    (should (string-search "encrypted room"
+                           (substring-no-properties (leman-room--initial-header encrypted-invite))))
+    (should (eq 'font-lock-warning-face
+                (get-text-property 0 'face (leman-room--initial-header encrypted))))))
+
+(ert-deftest leman-room--initial-footer ()
+  "Test initial room buffer footer."
+  (let ((plain (make-leman-room :id "!room:example.com"))
+        (invited (make-leman-room :id "!room:example.com" :status 'invite))
+        (space (make-leman-room :id "!room:example.com" :type "m.space"))
+        (invited-space (make-leman-room :id "!room:example.com" :status 'invite :type "m.space")))
+    ;; A plain room has an empty footer.
+    (should (string-empty-p (leman-room--initial-footer plain)))
+    ;; An invited room's footer offers to join.
+    (let ((footer (leman-room--initial-footer invited))
+          (pos (string-search "[Join this room]" (leman-room--initial-footer invited))))
+      (should (string-search "invited to this room" (substring-no-properties footer)))
+      (should pos)
+      (should (get-text-property pos 'button footer))
+      (should (functionp (get-text-property pos 'action footer))))
+    ;; A space's footer offers to view its rooms.
+    (let ((footer (leman-room--initial-footer space))
+          (pos (string-search "[View rooms in this space]" (leman-room--initial-footer space))))
+      (should (string-search "grouping of other rooms" (substring-no-properties footer)))
+      (should pos)
+      (should (get-text-property pos 'button footer))
+      (should (functionp (get-text-property pos 'action footer))))
+    ;; For an invited space, the invitation takes precedence.
+    (should (string-search "invited to this room"
+                           (substring-no-properties (leman-room--initial-footer invited-space))))))
 
 (provide 'leman-tests)
 
