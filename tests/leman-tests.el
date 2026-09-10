@@ -25,6 +25,7 @@
 (require 'leman-lib)
 (require 'leman-room)
 (require 'leman-room-list)
+(require 'leman-tabulated-room-list)
 
 ;; Variables from leman.el, which the tests don't load.
 (defvar leman-users)
@@ -273,6 +274,42 @@ URL differ from the previous one."
     ;; Rooms are sorted latest-first.
     (should (< (cl-position room-new items :test #'equal)
                (cl-position room-old items :test #'equal)))))
+
+(ert-deftest leman-tabulated-room-list--entry ()
+  "Test building a tabulated room list entry."
+  (let* ((session (make-leman-session :user (make-leman-user :id "@me:example.com")))
+         (room (make-leman-room :id "!room:example.com"))
+         (entry (leman-tabulated-room-list--entry session room))
+         (name (elt (elt entry 1) 5)))
+    ;; The entry identifies the room and has one column per format.
+    (should (eq room (car entry)))
+    (should (= (length (elt entry 1)) 10))
+    ;; A plain room's name has only the base face.
+    (should (equal '(:inherit (leman-tabulated-room-list-name))
+                   (get-text-property 0 'face (car name))))))
+
+(ert-deftest leman-tabulated-room-list--entry-membership-faces ()
+  "Test that invited and left rooms are face-modified.
+This checks the 'leave branch, which upstream ement.el malformed
+by passing the arguments to `cons' in reverse, and the
+`leman-room-status' slot, which upstream read from the wrong
+slot, so these branches never applied."
+  (let* ((session (make-leman-session :user (make-leman-user :id "@me:example.com")))
+         (invited-room (make-leman-room :id "!invited:example.com" :status 'invite))
+         (left-room (make-leman-room :id "!left:example.com" :status 'leave))
+         (invited-entry (leman-tabulated-room-list--entry session invited-room))
+         (left-entry (leman-tabulated-room-list--entry session left-room))
+         (invited-name (car (elt (elt invited-entry 1) 5)))
+         (left-name (car (elt (elt left-entry 1) 5))))
+    ;; Topics are prefixed, and the name's face inherits the membership face.
+    (should (string-search "[invited]"
+                           (substring-no-properties (elt (elt invited-entry 1) 6))))
+    (should (member 'leman-tabulated-room-list-invited
+                    (map-elt (get-text-property 0 'face invited-name) :inherit)))
+    (should (string-search "[left]"
+                           (substring-no-properties (elt (elt left-entry 1) 6))))
+    (should (member 'leman-tabulated-room-list-left
+                    (map-elt (get-text-property 0 'face left-name) :inherit)))))
 
 (provide 'leman-tests)
 

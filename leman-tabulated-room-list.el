@@ -331,6 +331,42 @@ To be called in `leman-sync-callback-hook'."
                                       ;; we need to handle it), we fall back to 0.
                                       (or (leman-room-latest-ts (car entry)) 0))))))
 
+(defun leman-tabulated-room-list--avatar (room avatar room-list-avatar)
+  "Return the avatar display string for ROOM's AVATAR.
+ROOM-LIST-AVATAR is the cached, resized avatar string, if any."
+  (if (and leman-tabulated-room-list-avatars avatar)
+      (or room-list-avatar
+          (if-let* ((avatar-image (get-text-property 0 'display avatar))
+                    (new-avatar-string (propertize " " 'display
+                                                   (leman--resize-image avatar-image
+                                                                        nil (frame-char-height)))))
+              (progn
+                ;; alist-get doesn't seem to return the new value when used with setf?
+                (setf (alist-get 'room-list-avatar (leman-room-local room))
+                      new-avatar-string)
+                new-avatar-string)
+            ;; If a room avatar image fails to download or decode
+            ;; and ends up nil, we return the empty string.
+            (leman-debug "nil avatar for room: " (leman-room-display-name room) (leman-room-canonical-alias room))
+            ""))
+    ;; Room avatars disabled.
+    ""))
+
+(defun leman-tabulated-room-list--latest-face (latest-ts)
+  "Return the face spec for a room's LATEST-TS timestamp.
+Colors are taken from `leman-tabulated-room-list-timestamp-colors'."
+  (when latest-ts
+    (let* ((difference-seconds (- (float-time) (/ latest-ts 1000)))
+           (n (cl-typecase difference-seconds
+                ((number 0 3599) ;; 1 hour to 1 day: 24 1-hour periods.
+                 (truncate (/ difference-seconds 600)))
+                ((number 3600 86400) ;; 1 day
+                 (+ 6 (truncate (/ difference-seconds 3600))))
+                (otherwise ;; Difference in weeks.
+                 (min (/ (length leman-tabulated-room-list-timestamp-colors) 2)
+                      (+ 24 (truncate (/ difference-seconds 86400 7))))))))
+      (list :foreground (elt leman-tabulated-room-list-timestamp-colors n)))))
+
 (defun leman-tabulated-room-list--entry (session room)
   "Return entry for ROOM in SESSION for `tabulated-list-entries'."
   (pcase-let* (((cl-struct leman-room id canonical-alias display-name avatar topic latest-ts summary
@@ -345,23 +381,7 @@ To be called in `leman-sync-callback-hook'."
                (e-unread (if (and buffer (buffer-modified-p buffer))
                              (propertize "U" 'help-echo "Unread") ""))
                (e-buffer (if buffer (propertize "B" 'help-echo "Room has buffer") ""))
-               (e-avatar (if (and leman-tabulated-room-list-avatars avatar)
-                             (or room-list-avatar
-                                 (if-let* ((avatar-image (get-text-property 0 'display avatar))
-                                           (new-avatar-string (propertize " " 'display
-                                                                          (leman--resize-image avatar-image
-                                                                                               nil (frame-char-height)))))
-                                     (progn
-                                       ;; alist-get doesn't seem to return the new value when used with setf?
-                                       (setf (alist-get 'room-list-avatar (leman-room-local room))
-                                             new-avatar-string)
-                                       new-avatar-string)
-                                   ;; If a room avatar image fails to download or decode
-                                   ;; and ends up nil, we return the empty string.
-                                   (leman-debug "nil avatar for room: " (leman-room-display-name room) (leman-room-canonical-alias room))
-                                   ""))
-                           ;; Room avatars disabled.
-                           ""))
+               (e-avatar (leman-tabulated-room-list--avatar room avatar room-list-avatar))
                ;; We have to copy the list, otherwise using `setf' on it
                ;; later causes its value to be mutated for every entry.
                (name-face (cl-copy-list '(:inherit (leman-tabulated-room-list-name))))
@@ -379,17 +399,7 @@ To be called in `leman-sync-callback-hook'."
                                         (leman--human-format-duration (- (time-convert nil 'integer) (/ latest-ts 1000))
                                                                       t)
                                       ""))
-               (latest-face (when latest-ts
-                              (let* ((difference-seconds (- (float-time) (/ latest-ts 1000))  )
-                                     (n (cl-typecase difference-seconds
-                                          ((number 0 3599) ;; 1 hour to 1 day: 24 1-hour periods.
-                                           (truncate (/ difference-seconds 600)))
-                                          ((number 3600 86400) ;; 1 day
-                                           (+ 6 (truncate (/ difference-seconds 3600))))
-                                          (otherwise ;; Difference in weeks.
-                                           (min (/ (length leman-tabulated-room-list-timestamp-colors) 2)
-                                                (+ 24 (truncate (/ difference-seconds 86400 7))))))))
-                                (list :foreground (elt leman-tabulated-room-list-timestamp-colors n)))))
+               (latest-face (leman-tabulated-room-list--latest-face latest-ts))
                (e-latest (or (when formatted-timestamp
                                (propertize formatted-timestamp
                                            'value latest-ts
@@ -398,7 +408,6 @@ To be called in `leman-sync-callback-hook'."
                              ""))
                (e-session (propertize (leman-user-id (leman-session-user session))
                                       'value session))
-               ;;  ((e-tags favorite-p low-priority-p) (leman-tabulated-room-list--tags room))
                (e-direct-p (if (leman--room-direct-p room session)
                                (propertize "d" 'help-echo "Direct room")
                              ""))
@@ -406,42 +415,33 @@ To be called in `leman-sync-callback-hook'."
                                  ((leman--room-low-priority-p room) "l")
                                  (" ")))
                (e-members (if member-count (number-to-string member-count) "")))
-    (when leman-tabulated-room-list-simplify-timestamps
-      (setf e-latest (replace-regexp-in-string
-                      (rx bos (1+ digit) (1+ alpha) (group (1+ (1+ digit) (1+ alpha))))
-                      "" e-latest t t 1)))
-    ;; Add face modifiers.
-    (when (and buffer (buffer-modified-p buffer))
-      ;; For some reason, `push' doesn't work with `map-elt'.
-      (setf (map-elt name-face :inherit)
-            (cons 'leman-tabulated-room-list-unread (map-elt name-face :inherit))))
-    (when (leman--room-direct-p room session)
-      (setf (map-elt name-face :inherit)
-            (cons 'leman-tabulated-room-list-direct (map-elt name-face :inherit))))
-    (when (leman--room-favourite-p room)
-      (push 'leman-tabulated-room-list-favourite (map-elt name-face :inherit)))
-    (when (leman--room-low-priority-p room)
-      (push 'leman-tabulated-room-list-low-priority (map-elt name-face :inherit)))
-    (pcase (leman-room-type room)
-      ('invite
-       (setf e-topic (concat (propertize "[invited]"
-                                         'face 'leman-tabulated-room-list-invited)
-                             " " e-topic)
-             (map-elt name-face :inherit) (cons 'leman-tabulated-room-list-invited
-                                                (map-elt name-face :inherit))))
-      ('leave
-       (setf e-topic (concat (propertize "[left]"
-                                         'face 'leman-tabulated-room-list-left)
-                             " " e-topic)
-             (map-elt name-face :inherit) (cons (map-elt name-face :inherit)
-                                                'leman-tabulated-room-list-left))))
-    (list room (vector e-unread e-priority e-buffer e-direct-p
-                       e-avatar e-name e-topic e-latest e-members
-                       ;; e-tags
-                       e-session
-                       ;; e-avatar
-                       ))))
-
+     (when leman-tabulated-room-list-simplify-timestamps
+       (setf e-latest (replace-regexp-in-string
+                       (rx bos (1+ digit) (1+ alpha) (group (1+ (1+ digit) (1+ alpha))))
+                       "" e-latest t t 1)))
+     ;; Add face modifiers.
+     (when (and buffer (buffer-modified-p buffer))
+       (push 'leman-tabulated-room-list-unread (map-elt name-face :inherit)))
+     (when (leman--room-direct-p room session)
+       (push 'leman-tabulated-room-list-direct (map-elt name-face :inherit)))
+     (when (leman--room-favourite-p room)
+       (push 'leman-tabulated-room-list-favourite (map-elt name-face :inherit)))
+     (when (leman--room-low-priority-p room)
+       (push 'leman-tabulated-room-list-low-priority (map-elt name-face :inherit)))
+     (pcase (leman-room-status room)
+       ('invite
+        (setf e-topic (concat (propertize "[invited]"
+                                          'face 'leman-tabulated-room-list-invited)
+                              " " e-topic))
+        (push 'leman-tabulated-room-list-invited (map-elt name-face :inherit)))
+       ('leave
+        (setf e-topic (concat (propertize "[left]"
+                                          'face 'leman-tabulated-room-list-left)
+                              " " e-topic))
+        (push 'leman-tabulated-room-list-left (map-elt name-face :inherit))))
+     (list room (vector e-unread e-priority e-buffer e-direct-p
+                        e-avatar e-name e-topic e-latest e-members
+                        e-session))))
 ;; TODO: Define sorters with a macro?  This gets repetitive and hard to update.
 
 (defun leman-tabulated-room-list-members< (a b)
@@ -454,8 +454,9 @@ A and B should be entries from `tabulated-list-mode'."
       (< (string-to-number a-members) (string-to-number b-members)))))
 
 (defun leman-tabulated-room-list-latest< (a b)
-  "Return non-nil if entry A has fewer members than room B.
-A and B should be entries from `tabulated-list-mode'."
+  "Return non-nil if entry A's latest event is older than entry B's.
+A and B should be entries from `tabulated-list-mode'.  Rooms with
+no latest event (e.g. invited rooms) sort first."
   (pcase-let* ((`(,_room-a [,_unread ,_priority ,_buffer ,_direct ,_avatar ,_name-for-list ,_topic ,a-latest ,_a-members ,_session]) a)
                (`(,_room-b [,_unread ,_priority ,_buffer ,_direct ,_avatar ,_name-for-list ,_topic ,b-latest ,_b-members ,_session]) b)
                (a-latest (get-text-property 0 'value a-latest))
