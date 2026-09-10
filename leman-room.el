@@ -2519,8 +2519,46 @@ To be used in `leman-room-view-hook', which see."
         (leman-event data)
         (otherwise (user-error "No event at point"))))))
 
+(defun leman-room--process-retro-chunk (chunk session)
+  "Process \"dir=b\" CHUNK of events for SESSION.
+Convert the events to `leman-event' structs, discarding events
+already known to SESSION, and return the new events as a list."
+  ;; NOTE: The events are converted in place in the vector, which is
+  ;; regrettable, but it's how we discard already-seen events.
+  (declare (function leman--make-event "leman.el")
+           (function leman--put-event "leman.el"))
+  (cl-loop for event across-ref chunk
+           do (if (gethash (alist-get 'event_id event) (leman-session-events session))
+                  ;; Duplicate event: set to nil to be ignored.
+                  (setf event nil)
+                ;; New event.
+                (setf event (leman--make-event event))
+                ;; HACK: Put events on events table.  See FIXME in caller about using the event hook.
+                (leman--put-event event nil session))
+           (leman-progress-update)
+           finally do (setf chunk (seq-remove #'null chunk))
+           finally return chunk))
+
+(defun leman-room--insert-retro-events (room buffer chunk set-prev-batch end)
+  "Insert earlier CHUNK events into ROOM's BUFFER.
+If SET-PREV-BATCH and END, set ROOM's prev-batch slot to END."
+  (with-current-buffer buffer
+    (save-window-excursion
+      ;; NOTE: See note in `leman--update-room-buffers'.
+      (when-let ((buffer-window (get-buffer-window buffer)))
+        (select-window buffer-window))
+      ;; FIXME: Use retro-loading in event handlers, or in --handle-events, anyway.
+      (leman-room--process-events chunk)
+      ;; Don't set the slot if the response doesn't include an "end" token (that
+      ;; would cause subsequent retro requests to fetch events from the end of the
+      ;; timeline, as if we had just joined).
+      (when (and set-prev-batch end)
+        ;; This feels a little hacky, but maybe not too bad.
+        (setf (leman-room-prev-batch room) end))
+      (setf leman-room-retro-loading nil))))
+
 (cl-defun leman-room-retro-callback (room session data
-                                          &key (set-prev-batch t))
+                                           &key (set-prev-batch t))
   "Push new DATA to ROOM on SESSION and add events to room buffer.
 If SET-PREV-BATCH is nil, don't set ROOM's prev-batch slot to the
 \"prev_batch\" token in response DATA (this should be set,
@@ -2530,16 +2568,16 @@ before the earliest-seen message)."
            (function leman--put-event "leman.el"))
   (pcase-let* (((cl-struct leman-room local) room)
 	       ((map _start end chunk state) data)
-               ((map buffer) local)
-               (num-events (length chunk))
-               ;; We do 3 things for chunk events, so we count them 3 times when
-               ;; reporting progress.  (We also may receive some state events for
-               ;; these chunk events, but we don't bother to include them in the
-               ;; count, and we don't report progress for them, because they are
-               ;; likely very few compared to the number of timeline events, which is
-               ;; what the user is interested in (e.g. when loading 1000 earlier
-               ;; messages in #emacs:matrix.org, only 31 state events were received).
-               (progress-max-value (* 3 num-events)))
+                ((map buffer) local)
+                (num-events (length chunk))
+                ;; We do 3 things for chunk events, so we count them 3 times when
+                ;; reporting progress.  (We also may receive some state events for
+                ;; these chunk events, but we don't bother to include them in the
+                ;; count, and we don't report progress for them, because they are
+                ;; likely very few compared to the number of timeline events, which is
+                ;; what the user is interested in (e.g. when loading 1000 earlier
+                ;; messages in #emacs:matrix.org, only 31 state events were received).
+                (progress-max-value (* 3 num-events)))
     ;; NOTE: Put the newly retrieved events at the end of the slots, because they should be
     ;; older events.  But reverse them first, because we're using "dir=b", which the
     ;; spec says causes the events to be returned in reverse-chronological order, and we
@@ -2557,40 +2595,11 @@ before the earliest-seen message)."
              finally do (setf (leman-room-state room)
                               (append (leman-room-state room) (append state nil))))
     (leman-with-progress-reporter (:reporter ("Leman: Processing earlier events..." 0 progress-max-value))
-      ;; Append timeline events (in the "chunk").
-      ;; NOTE: It's regrettable that we have to turn the chunk vector into a list before
-      ;; appending it to the timeline, but we have to discard events that we've already
-      ;; seen.
-      ;; TODO: Consider looping over the vector and pushing one-by-one instead of using
-      ;; `seq-remove' and `append' (might be faster).
-      (cl-loop for event across-ref chunk
-               do (if (gethash (alist-get 'event_id event) (leman-session-events session))
-                      ;; Duplicate event: set to nil to be ignored.
-                      (setf event nil)
-                    ;; New event.
-                    (setf event (leman--make-event event))
-                    ;; HACK: Put events on events table.  See FIXME above about using the event hook.
-                    (leman--put-event event nil session))
-               (leman-progress-update)
-               finally do
-               (setf chunk (seq-remove #'null chunk)
-                     (leman-room-timeline room) (append (leman-room-timeline room) chunk)))
+      (setf chunk (leman-room--process-retro-chunk chunk session)
+            (leman-room-timeline room) (append (leman-room-timeline room) chunk))
       (when buffer
         ;; Insert events into the room's buffer.
-        (with-current-buffer buffer
-          (save-window-excursion
-            ;; NOTE: See note in `leman--update-room-buffers'.
-            (when-let ((buffer-window (get-buffer-window buffer)))
-              (select-window buffer-window))
-            ;; FIXME: Use retro-loading in event handlers, or in --handle-events, anyway.
-            (leman-room--process-events chunk)
-            ;; Don't set the slot if the response doesn't include an "end" token (that
-            ;; would cause subsequent retro requests to fetch events from the end of the
-            ;; timeline, as if we had just joined).
-            (when (and set-prev-batch end)
-              ;; This feels a little hacky, but maybe not too bad.
-              (setf (leman-room-prev-batch room) end))
-            (setf leman-room-retro-loading nil)))))
+        (leman-room--insert-retro-events room buffer chunk set-prev-batch end)))
     (message "Leman: Loaded %s earlier events." num-events)))
 
 (defun leman-room--insert-events (events &optional retro)
