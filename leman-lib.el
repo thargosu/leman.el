@@ -508,74 +508,88 @@ globally."
 Interactively, with prefix, prompt for room and session,
 otherwise use current room."
   (interactive (leman-with-room-and-session (list leman-room leman-session)))
-  (cl-labels ((heading (string)
-                (propertize (or string "") 'face 'font-lock-builtin-face))
-              (id (string)
+  (pcase-let* (((cl-struct leman-room (local (map fetched-members-p))) room))
+    (if (not fetched-members-p)
+        ;; Members not fetched: fetch them and re-call this command.
+        (leman--get-joined-members room session
+          :then (lambda (_) (leman-room-describe room session)))
+      (leman-room--describe-buffer room session))))
+
+(defun leman-room--describe-member-pairs (members room session)
+  "Return sorted (FORMATTED . MXID) pairs for room MEMBERS.
+ROOM is on SESSION.  FORMATTED is the user's formatted name in
+ROOM, and MXID its ID in angle brackets.  Return a cons whose car
+is the pairs list and whose cdr is the maximum MXID display
+width."
+  (cl-labels ((id (string)
                 (propertize (or string "") 'face 'font-lock-constant-face))
               (member< (a b)
-                (string-collate-lessp (car a) (car b) nil t))
-              (format-ts (ts)
-                (format-time-string "%Y-%m-%d %H:%M:%S" (/ ts 1000))))
-    (pcase-let* (((cl-struct leman-room (id room-id) avatar display-name canonical-alias members timeline status topic
-                             (local (map fetched-members-p)))
-                  room)
-                 ((cl-struct leman-session user) session)
-                 ((cl-struct leman-user (id user-id)) user)
-                 (earliest-ts (cl-loop for event in timeline
-                                       minimize (leman-event-origin-server-ts event)))
-                 (latest-ts (cl-loop for event in timeline
-                                     maximize (leman-event-origin-server-ts event))))
-      (if (not fetched-members-p)
-          ;; Members not fetched: fetch them and re-call this command.
-          (leman--get-joined-members room session
-            :then (lambda (_) (leman-room-describe room session)))
-        (with-current-buffer (get-buffer-create (format "*Leman room description: %s*" (or display-name canonical-alias room-id)))
-          (let ((inhibit-read-only t))
-            (erase-buffer)
-            ;; We avoid looping twice by doing a bit more work here and
-            ;; returning a cons which we destructure.
-            (pcase-let* ((`(,member-pairs . ,name-width)
-                          (cl-loop for user being the hash-values of members
-                                   for formatted = (leman--format-user user room session)
-                                   for id = (format "<%s>" (id (leman-user-id user)))
-                                   collect (cons formatted id)
-                                   into pairs
-                                   maximizing (string-width id) into width
-                                   finally return (cons (cl-sort pairs #'member<) width)))
-                         ;; We put the MXID first, because users may use Unicode characters
-                         ;; in their displayname, which `string-width' does not always
-                         ;; return perfect results for, and putting it last prevents
-                         ;; alignment problems.
-                         (spec (format "%%-%ss %%s" name-width)))
-              (save-excursion
-                (insert "\"" (propertize (or display-name canonical-alias room-id) 'face 'font-lock-doc-face) "\"" " is a "
-                        (propertize (if (leman--space-p room)
-                                        "space"
-                                      "room")
-                                    'face 'font-lock-type-face)
-                        " "
-                        (propertize (pcase status
-                                      ('invite "invited")
-                                      ('join "joined")
-                                      ('leave "left")
-                                      (_ (symbol-name status)))
-                                    'face 'font-lock-comment-face)
-                        " on session <" (id user-id) ">.\n\n"
-                        (heading "Avatar: ") (or avatar "") "\n\n"
-                        (heading "ID: ") "<" (id room-id) ">" "\n"
-                        (heading "Alias: ") "<" (id canonical-alias) ">" "\n\n"
-                        (heading "Topic: ") (propertize (or topic "[none]") 'face 'font-lock-comment-face) "\n\n"
-                        (heading "Retrieved events: ") (number-to-string (length timeline)) "\n"
-                        (heading "  spanning: ") (format-ts earliest-ts)
-                        (heading " to ") (format-ts latest-ts) "\n\n"
-                        (heading "Members") " (" (number-to-string (hash-table-count members)) "):\n")
-                (pcase-dolist (`(,formatted . ,id) member-pairs)
-                  (insert "  " (format spec id formatted) "\n")))))
-          (unless (eq major-mode 'leman-describe-room-mode)
-            ;; Without this check, activating the mode again causes a "Cyclic keymap
-            ;; inheritance" error.
-            (leman-describe-room-mode))
-          (pop-to-buffer (current-buffer)))))))
+                (string-collate-lessp (car a) (car b) nil t)))
+    ;; We avoid looping twice by doing a bit more work here and
+    ;; returning a cons which the caller destructures.
+    (cl-loop for user being the hash-values of members
+             for formatted = (leman--format-user user room session)
+             for id = (format "<%s>" (id (leman-user-id user)))
+             collect (cons formatted id)
+             into pairs
+             maximizing (string-width id) into width
+             finally return (cons (cl-sort pairs #'member<) width))))
+
+(defun leman-room--describe-buffer (room session)
+  "Display a buffer describing ROOM on SESSION."
+  (pcase-let* (((cl-struct leman-room (id room-id) avatar display-name canonical-alias members timeline status topic)
+                room)
+               ((cl-struct leman-session user) session)
+               ((cl-struct leman-user (id user-id)) user)
+               (earliest-ts (cl-loop for event in timeline
+                                     minimize (leman-event-origin-server-ts event)))
+               (latest-ts (cl-loop for event in timeline
+                                   maximize (leman-event-origin-server-ts event))))
+    (cl-labels ((heading (string)
+                  (propertize (or string "") 'face 'font-lock-builtin-face))
+                (id (string)
+                  (propertize (or string "") 'face 'font-lock-constant-face))
+                (format-ts (ts)
+                  (format-time-string "%Y-%m-%d %H:%M:%S" (/ ts 1000))))
+      (with-current-buffer (get-buffer-create (format "*Leman room description: %s*" (or display-name canonical-alias room-id)))
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (pcase-let* ((`(,member-pairs . ,name-width)
+                        (leman-room--describe-member-pairs members room session))
+                       ;; We put the MXID first, because users may use Unicode characters
+                       ;; in their displayname, which `string-width' does not always
+                       ;; return perfect results for, and putting it last prevents
+                       ;; alignment problems.
+                       (spec (format "%%-%ss %%s" name-width)))
+            (save-excursion
+              (insert "\"" (propertize (or display-name canonical-alias room-id) 'face 'font-lock-doc-face) "\"" " is a "
+                      (propertize (if (leman--space-p room)
+                                      "space"
+                                    "room")
+                                  'face 'font-lock-type-face)
+                      " "
+                      (propertize (pcase status
+                                    ('invite "invited")
+                                    ('join "joined")
+                                    ('leave "left")
+                                    (_ (symbol-name status)))
+                                  'face 'font-lock-comment-face)
+                      " on session <" (id user-id) ">.\n\n"
+                      (heading "Avatar: ") (or avatar "") "\n\n"
+                      (heading "ID: ") "<" (id room-id) ">" "\n"
+                      (heading "Alias: ") "<" (id canonical-alias) ">" "\n\n"
+                      (heading "Topic: ") (propertize (or topic "[none]") 'face 'font-lock-comment-face) "\n\n"
+                      (heading "Retrieved events: ") (number-to-string (length timeline)) "\n"
+                      (heading "  spanning: ") (format-ts earliest-ts)
+                      (heading " to ") (format-ts latest-ts) "\n\n"
+                      (heading "Members") " (" (number-to-string (hash-table-count members)) "):\n"))
+            (pcase-dolist (`(,formatted . ,id) member-pairs)
+              (insert "  " (format spec id formatted) "\n"))))
+        (unless (eq major-mode 'leman-describe-room-mode)
+          ;; Without this check, activating the mode again causes a "Cyclic keymap
+          ;; inheritance" error.
+          (leman-describe-room-mode))
+        (pop-to-buffer (current-buffer))))))
 
 (defalias 'leman-room-describe #'leman-describe-room)
 
