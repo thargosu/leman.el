@@ -732,10 +732,10 @@ Also used for left rooms, in which case STATUS should be set to
     ;; Push the StrippedState events to the room's invite-state.  (These events have no
     ;; timestamp data.)  We also run the event hook, because for invited rooms, the
     ;; invite-state events include room name, topic, etc.
-    (cl-loop for event across-ref invite-state-events do
-             (setf event (leman--make-event event))
-             (push event (leman-room-invite-state room))
-             (run-hook-with-args 'leman-event-hook event room session))
+    (cl-loop for event across invite-state-events
+             for event-struct = (leman--make-event event)
+             do (push event-struct (leman-room-invite-state room))
+             (run-hook-with-args 'leman-event-hook event-struct room session))
 
     ;; Save room summary.
     (dolist (parameter '(m.heroes m.joined_member_count m.invited_member_count))
@@ -756,15 +756,18 @@ Also used for left rooms, in which case STATUS should be set to
     (cl-callf2 append (mapcar #'leman--make-event account-data-events)
                (alist-get 'new-account-data-events (leman-room-local room)))
 
-    ;; Save state and timeline events.
+    ;; Push the new state and timeline events to the room's slots,
+    ;; collecting their 'leman-event' structs (in their original order)
+    ;; for running hooks below.
     (cl-macrolet ((push-events (type accessor)
-                    ;; Push new events of TYPE to room's slot of ACCESSOR, and return the latest timestamp pushed.
-                    `(let ((ts 0))
-                       ;; NOTE: We replace each event in the vector with the
-                       ;; struct, which is used when calling hooks later.
+                    ;; Push new events of TYPE to room's slot of ACCESSOR.
+                    ;; Return a list of the event structs and the latest
+                    ;; origin-server-ts pushed.
+                    `(let ((ts 0) (event-structs nil))
                        (cl-loop for event across-ref (alist-get 'events ,type)
                                 do (setf event (leman--make-event event))
-                                do (push event (,accessor room))
+                                (push event event-structs)
+                                (push event (,accessor room))
                                 (when (leman--sync-messages-p session)
                                   (leman-progress-update))
                                 (when (> (leman-event-origin-server-ts event) ts)
@@ -772,32 +775,30 @@ Also used for left rooms, in which case STATUS should be set to
                        ;; One would think that one should use `maximizing' here, but, completely
                        ;; inexplicably, it sometimes returns nil, even when every single value it's comparing
                        ;; is a number.  It's absolutely bizarre, but I have to do the equivalent manually.
-                       ts)))
-      ;; FIXME: This is a bit convoluted and hacky now.  Refactor it.
-      (setf latest-timestamp
-            (max (push-events state leman-room-state)
-                 (push-events timeline leman-room-timeline)))
-      ;; NOTE: We also append the new events to the new-events list in the room's local
-      ;; slot, which is used by `leman--update-room-buffers' to insert only new events.
-      ;; FIXME: Does this also need to be done for invite-state events?
-      (cl-callf2 append (cl-coerce (alist-get 'events timeline) 'list)
-                 (alist-get 'new-events (leman-room-local room)))
-      ;; Update room's latest-timestamp slot.
-      (when (> latest-timestamp (or (leman-room-latest-ts room) 0))
-        (setf (leman-room-latest-ts room) latest-timestamp))
-      (unless (leman-session-has-synced-p session)
-        ;; Only set this token on initial sync, otherwise it would
-        ;; overwrite earlier tokens from loading earlier messages.
-        (setf (leman-room-prev-batch room) (alist-get 'prev_batch timeline))))
-    ;; Run event hook for state and timeline events.
-    (cl-loop for event across (alist-get 'events state)
-             do (run-hook-with-args 'leman-event-hook event room session)
-             (when (leman--sync-messages-p session)
-               (leman-progress-update)))
-    (cl-loop for event across (alist-get 'events timeline)
-             do (run-hook-with-args 'leman-event-hook event room session)
-             (when (leman--sync-messages-p session)
-               (leman-progress-update)))
+                       (list (nreverse event-structs) ts))))
+      (pcase-let* ((`(,state-event-structs ,state-ts)
+                    (push-events state leman-room-state))
+                   (`(,timeline-event-structs ,timeline-ts)
+                    (push-events timeline leman-room-timeline)))
+        (setf latest-timestamp (max state-ts timeline-ts))
+        ;; NOTE: We also append the new events to the new-events list in the room's local
+        ;; slot, which is used by `leman--update-room-buffers' to insert only new events.
+        ;; FIXME: Does this also need to be done for invite-state events?
+        (cl-callf2 append timeline-event-structs
+                   (alist-get 'new-events (leman-room-local room)))
+        ;; Update room's latest-timestamp slot.
+        (when (> latest-timestamp (or (leman-room-latest-ts room) 0))
+          (setf (leman-room-latest-ts room) latest-timestamp))
+        (unless (leman-session-has-synced-p session)
+          ;; Only set this token on initial sync, otherwise it would
+          ;; overwrite earlier tokens from loading earlier messages.
+          (setf (leman-room-prev-batch room) (alist-get 'prev_batch timeline)))
+        ;; Run event hook for state and timeline events.
+        (dolist (event-structs (list state-event-structs timeline-event-structs))
+          (dolist (event event-structs)
+            (run-hook-with-args 'leman-event-hook event room session)
+            (when (leman--sync-messages-p session)
+              (leman-progress-update))))))
     ;; Ephemeral events (do this after state and timeline hooks, so those events will be
     ;; in the hash tables).
     (cl-loop for event across (alist-get 'events ephemeral)
@@ -820,7 +821,6 @@ Also used for left rooms, in which case STATUS should be set to
 	;; until the gap is filled).
 	(leman-room-retro-to-token room session (alist-get 'prev_batch timeline)
 				   (leman-session-next-batch session))))))
-
 (defun leman--push-left-room-events (session left-room)
   "Push events for LEFT-ROOM into that room in SESSION."
   (leman--push-joined-room-events session left-room 'leave))
