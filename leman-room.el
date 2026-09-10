@@ -4129,6 +4129,16 @@ Formats according to `leman-room-message-format-spec', which see."
          (propertize " "
                      'display `((margin right-margin) ,string)))))))
 
+(defun leman-room--format-spec-value (formatter event room session spec)
+  "Return the value that formatter FORMATTER gives for format spec SPEC.
+EVENT, ROOM, and SESSION are passed to FORMATTER.  If FORMATTER
+returns nil, return a placeholder string."
+  (or (funcall formatter event room session)
+      (let ((print-level 1))
+        (propertize (format "[Event has no value for spec \"?%s\"]" (char-to-string spec))
+                    'face 'font-lock-comment-face
+                    'help-echo (format "%S" event)))))
+
 (cl-defun leman-room--format-message (event room session &optional (format leman-room-message-format-spec))
   "Return EVENT in ROOM on SESSION formatted according to FORMAT.
 Format defaults to `leman-room-message-format-spec', which see."
@@ -4155,11 +4165,7 @@ Format defaults to `leman-room-message-format-spec', which see."
                               (delete-region (1- (match-beginning 0)) (match-end 0)))
                              (formatter (or (alist-get spec leman-room-event-formatters)
                                             (error "Invalid format character: `%%%c'" spec)))
-                             (val (or (funcall formatter event room session)
-                                      (let ((print-level 1))
-                                        (propertize (format "[Event has no value for spec \"?%s\"]" (char-to-string spec))
-                                                    'face 'font-lock-comment-face
-                                                    'help-echo (format "%S" event)))))
+                             (val (leman-room--format-spec-value formatter event room session spec))
                              ;; Pad result to desired length.
                              (text (format (concat "%" num "s") val)))
                         (insert text)))
