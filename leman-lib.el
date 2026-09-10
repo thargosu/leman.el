@@ -55,8 +55,11 @@
 (defvar leman-ewoc)
 (defvar leman-room)
 (defvar leman-session)
-;; Optional dependency: registered with in `leman--annotate-room', etc.
+;; Optional dependencies: the annotator registry is registered with
+;; in `leman--annotate-room', etc.  Marginalia renamed the registry
+;; from `marginalia-annotator-registry' to `marginalia-annotators'.
 (defvar marginalia-annotator-registry)
+(defvar marginalia-annotators)
 
 (defvar leman-room-buffer-name-prefix)
 (defvar leman-room-buffer-name-suffix)
@@ -844,8 +847,12 @@ the room's ID; the room is looked up by that ID in all sessions."
              'face 'leman-completion-annotation))))
 
 (with-eval-after-load 'marginalia
-  (add-to-list 'marginalia-annotator-registry '(leman-room leman--annotate-room))
-  (add-to-list 'marginalia-annotator-registry '(leman-session leman--annotate-session)))
+  (when-let ((registry (cond ((boundp 'marginalia-annotators)
+                              'marginalia-annotators)
+                             ((boundp 'marginalia-annotator-registry)
+                              'marginalia-annotator-registry))))
+    (add-to-list registry '(leman-room leman--annotate-room))
+    (add-to-list registry '(leman-session leman--annotate-session))))
 
 (cl-defun leman-complete-session (&key (prompt "Session: "))
   "Return an Leman session selected with completion."
