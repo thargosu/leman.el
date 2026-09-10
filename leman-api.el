@@ -98,13 +98,17 @@ usually the DATA argument should be passed through
                      (url-parse-make-urlobj type nil nil host portspec filename nil data t)))
                (headers (leman-alist "Content-Type" content-type))
                (plz-args))
-    (when token
-      ;; Almost every request will require a token (only a few, like checking login flows, don't),
-      ;; so we simplify the API by using the token automatically when the session has one.
-      (push (cons "Authorization" (concat "Bearer " token)) headers))
-    (setf plz-args (list method url :headers headers :body data :body-type data-type
-                         :as json-read-fn :then then :else else
-                         :connect-timeout connect-timeout :timeout timeout :noquery t))
+     (when token
+       ;; Almost every request will require a token (only a few, like checking login flows, don't),
+       ;; so we simplify the API by using the token automatically when the session has one.
+       (push (cons "Authorization" (concat "Bearer " token)) headers))
+     ;; Annotate the error with the request URL, so it's clear which request failed.
+     (when (eq else #'leman-api-error)
+       (setf else (lambda (plz-error)
+                    (leman-api-error plz-error url))))
+     (setf plz-args (list method url :headers headers :body data :body-type data-type
+                          :as json-read-fn :then then :else else
+                          :connect-timeout connect-timeout :timeout timeout :noquery t))
     ;; Omit `then' from debugging because if it's a partially applied
     ;; function on the session object, which may be very large, it
     ;; will take a very long time to print into the warnings buffer.
@@ -116,8 +120,9 @@ usually the DATA argument should be passed through
 
 (define-error 'leman-api-error "Leman API error" 'error)
 
-(defun leman-api-error (plz-error)
-  "Signal an Leman API error for PLZ-ERROR."
+(defun leman-api-error (plz-error &optional url)
+  "Signal an Leman API error for PLZ-ERROR.
+If URL, include it in the error message."
   ;; This feels a little messy, but it seems to be reasonable.
   (pcase-let* (((cl-struct plz-error response
                            (message plz-message) (curl-error `(,curl-exit-code . ,curl-message)))
@@ -135,7 +140,8 @@ usually the DATA argument should be passed through
                                             (alist-get 'error json-object))
                                           curl-message
                                           plz-message))))
-
+    (when url
+      (setf error-message (concat error-message " [" url "]")))
     (signal 'leman-api-error (list error-message))))
 
 ;;;; Footer
