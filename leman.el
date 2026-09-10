@@ -199,6 +199,151 @@ It shouldn't usually be necessary to change this."
 
 ;;;; Commands
 
+(defun leman--new-session (user-id &optional uri-prefix)
+  "Return a new session for USER-ID, using URI-PREFIX if given."
+  (unless (string-match (rx bos "@" (group (1+ (not (any ":")))) ; Username
+                            ":" (group (optional (1+ (not (any blank)))))) ; Server name
+                        user-id)
+    (user-error "Invalid user ID format: use @USERNAME:SERVER"))
+  (let* ((username (match-string 1 user-id))
+         (server-name (match-string 2 user-id))
+         (uri-prefix (or uri-prefix (leman--hostname-uri server-name)))
+         (user (make-leman-user :id user-id :username username))
+         (server (make-leman-server :name server-name :uri-prefix uri-prefix))
+         (transaction-id (leman--initial-transaction-id))
+         (initial-device-display-name (format "Leman.el: %s@%s"
+                                              ;; Just to be extra careful:
+                                              (or user-login-name "[unknown user-login-name]")
+                                              (or (system-name) "[unknown system-name]")))
+         (device-id (secure-hash 'sha256 initial-device-display-name)))
+    (make-leman-session :user user :server server :transaction-id transaction-id
+                        :device-id device-id :initial-device-display-name initial-device-display-name
+                        :events (make-hash-table :test #'equal))))
+
+(defun leman--password-login (session &optional password)
+  "Log in to SESSION using PASSWORD, prompting if not given."
+  (pcase-let* (((cl-struct leman-session user device-id initial-device-display-name) session)
+               ((cl-struct leman-user id) user)
+               (data (leman-alist "type" "m.login.password"
+                                  "identifier"
+                                  (leman-alist "type" "m.id.user"
+                                               "user" id)
+                                  "password" (or password
+                                                 (read-passwd (format "Password for %s: " id)))
+                                  "device_id" device-id
+                                  "initial_device_display_name" initial-device-display-name)))
+    ;; TODO: Clear password in callback (if we decide to hold on to it for retrying login timeouts).
+    (leman-api session "login" :method 'post :data (json-encode data)
+      :then (apply-partially #'leman--login-callback session))
+    (leman-message "Logging in with password...")))
+
+(defun leman--sso-login-with-token (token session)
+  "Submit SSO login TOKEN for SESSION."
+  (pcase-let* (((cl-struct leman-session user device-id initial-device-display-name) session)
+               ((cl-struct leman-user id) user)
+               (data (leman-alist
+                      "type" "m.login.token"
+                      "identifier" (leman-alist "type" "m.id.user"
+                                                "user" id)
+                      "token" token
+                      "device_id" device-id
+                      "initial_device_display_name" initial-device-display-name)))
+    (leman-api session "login" :method 'post
+      :data (json-encode data)
+      :then (apply-partially #'leman--login-callback session))))
+
+(defun leman--sso-login (session)
+  "Log in to SESSION using single sign-on.
+Starts a throwaway, local HTTP server on `leman-sso-server-port'
+to receive the login token, and browses to the server's SSO
+redirect page."
+  (let (sso-server-process)
+    (setf sso-server-process
+          (make-network-process
+           :name "leman-sso" :family 'ipv4 :host 'local :service leman-sso-server-port
+           :filter (lambda (process string)
+                     ;; NOTE: This is technically wrong, because it's not guaranteed that the
+                     ;; string will be a complete request--it could just be a chunk.  But in
+                     ;; practice, if this works, it's much simpler than setting up process log
+                     ;; functions and per-client buffers for this throwaway, pretend HTTP server.
+                     (when (string-match (rx "GET /?loginToken=" (group (0+ nonl)) " " (0+ nonl)) string)
+                       (unwind-protect
+                           (progn
+                             (leman--sso-login-with-token (match-string 1 string) session)
+                             (process-send-string process "HTTP/1.0 202 Accepted
+Content-Type: text/plain; charset=utf-8
+
+Leman: SSO login accepted; session token received.  Connecting to Matrix server.  (You may close this page.)")
+                             (process-send-eof process))
+                         (delete-process sso-server-process)
+                         (delete-process process))))
+           :server t :noquery t))
+    ;; Kill server after 2 minutes in case of problems.
+    (run-at-time 120 nil (lambda ()
+                           (when (process-live-p sso-server-process)
+                             (delete-process sso-server-process))))
+    (let ((url (concat (leman-server-uri-prefix (leman-session-server session))
+                       "/_matrix/client/r0/login/sso/redirect?redirectUrl=http://localhost:"
+                       (number-to-string leman-sso-server-port))))
+      (funcall browse-url-secondary-browser-function url)
+      (message "Browsing to single sign-on page <%s>..." url))))
+
+(defun leman--login-with-flow (flow session &optional password)
+  "Begin login FLOW (\"password\" or \"sso\") for SESSION.
+PASSWORD, if given, is used for password login."
+  (pcase flow
+    ("password" (leman--password-login session password))
+    ("sso" (leman--sso-login session))
+    (_ (error "Leman: Unsupported login flow: %s  Server:%S"
+              flow (leman-server-uri-prefix (leman-session-server session))))))
+
+(defun leman--connect-flows-callback (session password data)
+  "Begin a login flow supported by the server for SESSION.
+PASSWORD, if given, is used for password login; otherwise the
+user is prompted."
+  (let ((flows (cl-loop for flow across (map-elt data 'flows)
+                        for type = (map-elt flow 'type)
+                        when (member type '("m.login.password" "m.login.sso"))
+                        collect type)))
+    (pcase (length flows)
+      (0 (error "Leman: No supported login flows:  Server:%S  Supported flows:%S"
+                (leman-server-uri-prefix (leman-session-server session))
+                (map-elt data 'flows)))
+      (1 (leman--login-with-flow (string-trim-left (car flows) (rx "m.login."))
+                                 session password))
+      (_ (leman--login-with-flow
+          (completing-read "Select authentication method: "
+                           (cl-loop for flow in flows
+                                    collect (string-trim-left flow (rx "m.login."))))
+          session password)))))
+
+(defun leman--session-start-sync (session)
+  "Register SESSION in `leman-sessions' and start syncing it."
+  ;; HACK: If session is already in leman-sessions, this replaces it.  I think that's okay...
+  (setf (alist-get (leman-user-id (leman-session-user session))
+                   leman-sessions nil nil #'equal)
+        session)
+  (leman--sync session :timeout leman-initial-sync-timeout))
+
+(defun leman--connect-args ()
+  "Return arguments for interactively calling `leman-connect'.
+With prefix arg, ignore any saved session and prompt to log in
+again; otherwise, use a saved session if one is available."
+  (if current-prefix-arg
+      ;; Force new session.
+      (list :user-id (read-string "User ID: " nil 'leman-connect-user-id-history))
+    ;; Use known session.
+    (unless leman-sessions
+      ;; Read sessions from disk.
+      (condition-case err
+          (setf leman-sessions (leman--read-sessions))
+        (error (display-warning 'leman (format "Unable to read session data from disk (%s).  Prompting to log in again."
+                                               (error-message-string err))))))
+    (cl-case (length leman-sessions)
+      (0 (list :user-id (read-string "User ID: " nil 'leman-connect-user-id-history)))
+      (1 (list :session (cdar leman-sessions)))
+      (otherwise (list :session (leman-complete-session))))))
+
 ;;;###autoload
 (cl-defun leman-connect (&key user-id password uri-prefix session)
   "Connect to Matrix with USER-ID and PASSWORD, or using SESSION.
@@ -216,134 +361,18 @@ the port, e.g.
 
   \"https://matrix-client.matrix.org\"
   \"http://localhost:8080\""
-  (interactive (if current-prefix-arg
-                   ;; Force new session.
-                   (list :user-id (read-string "User ID: " nil 'leman-connect-user-id-history))
-                 ;; Use known session.
-                 (unless leman-sessions
-                   ;; Read sessions from disk.
-                   (condition-case err
-                       (setf leman-sessions (leman--read-sessions))
-                     (error (display-warning 'leman (format "Unable to read session data from disk (%s).  Prompting to log in again."
-                                                            (error-message-string err))))))
-                 (cl-case (length leman-sessions)
-                   (0 (list :user-id (read-string "User ID: " nil 'leman-connect-user-id-history)))
-                   (1 (list :session (cdar leman-sessions)))
-                   (otherwise (list :session (leman-complete-session))))))
-  (let (sso-server-process)
-    (cl-labels ((new-session ()
-                  (unless (string-match (rx bos "@" (group (1+ (not (any ":")))) ; Username
-                                            ":" (group (optional (1+ (not (any blank)))))) ; Server name
-                                        user-id)
-                    (user-error "Invalid user ID format: use @USERNAME:SERVER"))
-                  (let* ((username (match-string 1 user-id))
-                         (server-name (match-string 2 user-id))
-                         (uri-prefix (or uri-prefix (leman--hostname-uri server-name)))
-                         (user (make-leman-user :id user-id :username username))
-                         (server (make-leman-server :name server-name :uri-prefix uri-prefix))
-                         (transaction-id (leman--initial-transaction-id))
-                         (initial-device-display-name (format "Leman.el: %s@%s"
-                                                              ;; Just to be extra careful:
-                                                              (or user-login-name "[unknown user-login-name]")
-                                                              (or (system-name) "[unknown system-name]")))
-                         (device-id (secure-hash 'sha256 initial-device-display-name)))
-                    (make-leman-session :user user :server server :transaction-id transaction-id
-                                        :device-id device-id :initial-device-display-name initial-device-display-name
-                                        :events (make-hash-table :test #'equal))))
-                (password-login ()
-                  (pcase-let* (((cl-struct leman-session user device-id initial-device-display-name) session)
-                               ((cl-struct leman-user id) user)
-                               (data (leman-alist "type" "m.login.password"
-                                                  "identifier"
-                                                  (leman-alist "type" "m.id.user"
-                                                               "user" id)
-                                                  "password" (or password
-                                                                 (read-passwd (format "Password for %s: " id)))
-                                                  "device_id" device-id
-                                                  "initial_device_display_name" initial-device-display-name)))
-                    ;; TODO: Clear password in callback (if we decide to hold on to it for retrying login timeouts).
-                    (leman-api session "login" :method 'post :data (json-encode data)
-                      :then (apply-partially #'leman--login-callback session))
-                    (leman-message "Logging in with password...")))
-                (sso-filter (process string)
-                  ;; NOTE: This is technically wrong, because it's not guaranteed that the
-                  ;; string will be a complete request--it could just be a chunk.  But in
-                  ;; practice, if this works, it's much simpler than setting up process log
-                  ;; functions and per-client buffers for this throwaway, pretend HTTP server.
-                  (when (string-match (rx "GET /?loginToken=" (group (0+ nonl)) " " (0+ nonl)) string)
-                    (unwind-protect
-                        (pcase-let* ((token (match-string 1 string))
-                                     ((cl-struct leman-session user device-id initial-device-display-name)
-                                      session)
-                                     ((cl-struct leman-user id) user)
-                                     (data (leman-alist
-                                            "type" "m.login.token"
-                                            "identifier" (leman-alist "type" "m.id.user"
-                                                                      "user" id)
-                                            "token" token
-                                            "device_id" device-id
-                                            "initial_device_display_name" initial-device-display-name)))
-                          (leman-api session "login" :method 'post
-                            :data (json-encode data)
-                            :then (apply-partially #'leman--login-callback session))
-                          (process-send-string process "HTTP/1.0 202 Accepted
-Content-Type: text/plain; charset=utf-8
-
-Leman: SSO login accepted; session token received.  Connecting to Matrix server.  (You may close this page.)")
-                          (process-send-eof process))
-                      (delete-process sso-server-process)
-                      (delete-process process))))
-                (sso-login ()
-                  (setf sso-server-process
-                        (make-network-process
-                         :name "leman-sso" :family 'ipv4 :host 'local :service leman-sso-server-port
-                         :filter #'sso-filter :server t :noquery t))
-                  ;; Kill server after 2 minutes in case of problems.
-                  (run-at-time 120 nil (lambda ()
-                                         (when (process-live-p sso-server-process)
-                                           (delete-process sso-server-process))))
-                  (let ((url (concat (leman-server-uri-prefix (leman-session-server session))
-                                     "/_matrix/client/r0/login/sso/redirect?redirectUrl=http://localhost:"
-                                     (number-to-string leman-sso-server-port))))
-                    (funcall browse-url-secondary-browser-function url)
-                    (message "Browsing to single sign-on page <%s>..." url)))
-                (flows-callback (data)
-                  (let ((flows (cl-loop for flow across (map-elt data 'flows)
-                                        for type = (map-elt flow 'type)
-                                        when (member type '("m.login.password" "m.login.sso"))
-                                        collect type)))
-                    (pcase (length flows)
-                      (0 (error "Leman: No supported login flows:  Server:%S  Supported flows:%S"
-                                (leman-server-uri-prefix (leman-session-server session))
-                                (map-elt data 'flows)))
-                      (1 (pcase (car flows)
-                           ("m.login.password" (password-login))
-                           ("m.login.sso" (sso-login))
-                           (_ (error "Leman: Unsupported login flow: %s  Server:%S  Supported flows:%S"
-                                     (car flows) (leman-server-uri-prefix (leman-session-server session))
-                                     (map-elt data 'flows)))))
-                      (_ (pcase (completing-read "Select authentication method: "
-                                                 (cl-loop for flow in flows
-                                                          collect (string-trim-left flow (rx "m.login."))))
-                           ("password" (password-login))
-                           ("sso" (sso-login))
-                           (else (error "Leman: Unsupported login flow:%S  Server:%S  Supported flows:%S"
-                                        else (leman-server-uri-prefix (leman-session-server session))
-                                        (map-elt data 'flows)))))))))
-      (if session
-          ;; Start syncing given session.
-          (let ((user-id (leman-user-id (leman-session-user session))))
-            ;; HACK: If session is already in leman-sessions, this replaces it.  I think that's okay...
-            (setf (alist-get user-id leman-sessions nil nil #'equal) session)
-            (leman--sync session :timeout leman-initial-sync-timeout))
-        ;; Start password login flow.  Prompt for user ID and password
-        ;; if not given (i.e. if not called interactively.)
-        (unless user-id
-          (setf user-id (read-string "User ID: " nil 'leman-connect-user-id-history)))
-        (setf session (new-session))
-        (when (leman-api session "login" :then #'flows-callback)
-          (message "Leman: Checking server's login flows..."))))))
-
+  (interactive (leman--connect-args))
+  (if session
+      ;; Start syncing given session.
+      (leman--session-start-sync session)
+    ;; Start the login flow.  Prompt for user ID if not given (i.e. if
+    ;; not called interactively).
+    (unless user-id
+      (setf user-id (read-string "User ID: " nil 'leman-connect-user-id-history)))
+    (setf session (leman--new-session user-id uri-prefix))
+    (when (leman-api session "login"
+            :then (apply-partially #'leman--connect-flows-callback session password))
+      (message "Leman: Checking server's login flows..."))))
 (defun leman-disconnect (sessions)
   "Disconnect from SESSIONS.
 Interactively, with prefix, disconnect from all sessions.  If
@@ -388,12 +417,10 @@ Useful in, e.g. `leman-disconnect-hook', which see."
 
 (defun leman--login-callback (session data)
   "Record DATA from logging in to SESSION and do initial sync."
-  (pcase-let* (((cl-struct leman-session (user (cl-struct leman-user (id user-id)))) session)
-               ((map ('access_token token) ('device_id device-id)) data))
+  (pcase-let* (((map ('access_token token) ('device_id device-id)) data))
     (setf (leman-session-token session) token
-          (leman-session-device-id session) device-id
-          (alist-get user-id leman-sessions nil nil #'equal) session)
-    (leman--sync session :timeout leman-initial-sync-timeout)))
+          (leman-session-device-id session) device-id)
+    (leman--session-start-sync session)))
 
 ;;;; Functions
 
