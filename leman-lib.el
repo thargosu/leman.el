@@ -643,6 +643,35 @@ Returns one of nil (meaning default rules are used), `all-loud',
                  'mentions-and-keywords)
                 ((tweak-rule-p "sound" room-rule) 'all-loud)))))))
 
+(defun leman-room--notification-state-rules (room)
+  "Return the push rules to set for each notification state of ROOM.
+Return an alist keyed on notification state (nil, `all',
+`mentions-and-keywords', or `none'), whose values are alists keyed
+on rule kind (\"override\" or \"room\"), whose values are the rule
+to set, or nil to delete the rule."
+  (leman-alist
+   nil (leman-alist
+        "override" nil
+        "room" nil)
+   'all (leman-alist
+         "override" nil
+         "room" (leman-alist
+                 'actions (vector "notify" (leman-alist
+                                            'set_tweak "sound"
+                                            'value "default"))))
+   'mentions-and-keywords (leman-alist
+                           "override" nil
+                           "room" (leman-alist
+                                   'actions (vector "dont_notify")))
+   'none (leman-alist
+          "override" (leman-alist
+                      'actions (vector "dont_notify")
+                      'conditions (vector (leman-alist
+                                           'kind "event_match"
+                                           'key "room_id"
+                                           'pattern (leman-room-id room))))
+          "room" nil)))
+
 (defun leman-room-set-notification-state (state room session)
   "Set notification STATE for ROOM on SESSION.
 Interactively, with prefix, prompt for room and session,
@@ -686,46 +715,20 @@ default, `all', `mentions-and-keywords', or `none'."
                                            :method 'put :data (json-encode (leman-alist 'enabled t))
                                            :then message-fn))
                                      message-fn)))
-                  (leman-api session endpoint :queue queue :method method :version "r0"
-                    :data (json-encode rule)
-                    :then then
-                    :else (lambda (plz-error)
-                            (pcase-let* (((cl-struct plz-error response) plz-error)
-                                         ((cl-struct plz-response status) response))
-                              (pcase status
-                                (404 (pcase rule
-                                       (`nil
-                                        ;; Room already had no rules, so none being found is not an
-                                        ;; error.
-                                        nil)
-                                       (_ ;; Unexpected error: re-signal.
-                                        (leman-api-error plz-error))))
-                                (_ ;; Unexpected error: re-signal.
-                                 (leman-api-error plz-error)))))))))
-    (pcase-let* ((available-states
-                  (leman-alist
-                   nil (leman-alist
-                        "override" nil
-                        "room" nil)
-                   'all (leman-alist
-                         "override" nil
-                         "room" (leman-alist
-                                 'actions (vector "notify" (leman-alist
-                                                            'set_tweak "sound"
-                                                            'value "default"))))
-                   'mentions-and-keywords (leman-alist
-                                           "override" nil
-                                           "room" (leman-alist
-                                                   'actions (vector "dont_notify")))
-                   'none (leman-alist
-                          "override" (leman-alist
-                                      'actions (vector "dont_notify")
-                                      'conditions (vector (leman-alist
-                                                           'kind "event_match"
-                                                           'key "room_id"
-                                                           'pattern (leman-room-id room))))
-                          "room" nil)))
-                 (kinds-and-rules (alist-get state available-states nil nil #'equal)))
+                   (leman-api session endpoint :queue queue :method method :version "r0"
+                     :data (json-encode rule)
+                     :then then
+                     :else (lambda (plz-error)
+                             (pcase-let* (((cl-struct plz-error response) plz-error)
+                                          ((cl-struct plz-response status) response))
+                               ;; A 404 for a rule being deleted means the room already
+                               ;; had no rules, which is not an error; anything else
+                               ;; re-signals.
+                               (unless (and (equal 404 status) (null rule))
+                                 (leman-api-error plz-error))))))))
+    (let ((kinds-and-rules (alist-get state
+                                      (leman-room--notification-state-rules room)
+                                      nil nil #'equal)))
       (cl-loop with queue = (make-plz-queue :limit 1)
                with total = (1- (length kinds-and-rules))
                for count from 0
