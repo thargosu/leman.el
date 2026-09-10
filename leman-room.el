@@ -4307,43 +4307,19 @@ HTML is rendered to Emacs text using `shr-insert-document'."
 
 (defun leman-room--user-color (user)
   "Return a color in which to display USER's messages."
-  (cl-labels ((relative-luminance (rgb)
-                ;; Copy of `modus-themes-wcag-formula', an elegant
-                ;; implementation by Protesilaos Stavrou.  Also see
-                ;; <https://en.wikipedia.org/wiki/Relative_luminance> and
-                ;; <https://www.w3.org/TR/WCAG20/#relativeluminancedef>.
-                (cl-loop for k in '(0.2126 0.7152 0.0722)
-                         for x in rgb
-                         sum (* k (if (<= x 0.03928)
-                                      (/ x 12.92)
-                                    (expt (/ (+ x 0.055) 1.055) 2.4)))))
-              (contrast-ratio (a b)
-                ;; Copy of `modus-themes-contrast'; see above.
-                (let ((ct (/ (+ (relative-luminance a) 0.05)
-                             (+ (relative-luminance b) 0.05))))
-                  (max ct (/ ct))))
-              (increase-contrast (color against target toward)
-                (let ((gradient (cdr (color-gradient color toward 20)))
-                      new-color)
-                  (cl-loop do (setf new-color (pop gradient))
-                           while new-color
-                           until (>= (contrast-ratio new-color against) target)
-                           ;; Avoid infinite loop in case of weirdness
-                           ;; by returning color as a fallback.
-                           finally return (or new-color color)))))
-    (let* ((id (leman-user-id user))
-           (id-hash (float (+ (abs (sxhash id)) leman-room-prism-color-adjustment)))
-           ;; TODO: Wrap-around the value to get the color I want.
-           (ratio (/ id-hash (float most-positive-fixnum)))
-           (color-num (round (* (* 255 255 255) ratio)))
-           (color-rgb (list (/ (float (logand color-num 255)) 255)
-                            (/ (float (ash (logand color-num 65280) -8)) 255)
-                            (/ (float (ash (logand color-num 16711680) -16)) 255)))
-           (background-rgb (color-name-to-rgb (face-background 'default))))
-      (when (< (contrast-ratio color-rgb background-rgb) leman-room-prism-minimum-contrast)
-        (setf color-rgb (increase-contrast color-rgb background-rgb leman-room-prism-minimum-contrast
-                                           (color-name-to-rgb (face-foreground 'default)))))
-      (apply #'color-rgb-to-hex (append color-rgb (list 2))))))
+  (let* ((id (leman-user-id user))
+         (id-hash (float (+ (abs (sxhash id)) leman-room-prism-color-adjustment)))
+         ;; TODO: Wrap-around the value to get the color I want.
+         (ratio (/ id-hash (float most-positive-fixnum)))
+         (color-num (round (* (* 255 255 255) ratio)))
+         (color-rgb (list (/ (float (logand color-num 255)) 255)
+                          (/ (float (ash (logand color-num 65280) -8)) 255)
+                          (/ (float (ash (logand color-num 16711680) -16)) 255)))
+         (background-rgb (color-name-to-rgb (face-background 'default))))
+    (when (< (leman--contrast-ratio color-rgb background-rgb) leman-room-prism-minimum-contrast)
+      (setf color-rgb (leman--increase-contrast color-rgb background-rgb leman-room-prism-minimum-contrast
+                                                (color-name-to-rgb (face-foreground 'default)))))
+    (apply #'color-rgb-to-hex (append color-rgb (list 2)))))
 
 ;;;;; Compose buffer
 
