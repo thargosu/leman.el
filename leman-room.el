@@ -4272,6 +4272,26 @@ by bridges).  Returns DOM."
          (leman-room--rewrite-mxc-imgs child session)))))
   dom)
 
+(defun leman-room--shr-image-data-sync (url)
+  "Return image spec for URL, fetching synchronously if needed.
+Like shr's image handling, but synchronous: returns the cached
+image data when present, otherwise fetches with
+`url-retrieve-synchronously' and populates the URL cache, so
+subsequent renders use the cache."
+  (if (url-is-cached url)
+      (shr-get-image-data url)
+    (let (buffer)
+      (unwind-protect
+          (when-let ((response (url-retrieve-synchronously url)))
+            (setf buffer response)
+            (with-current-buffer response
+              (url-store-in-cache response)
+              (goto-char (point-min))
+              (when (or (search-forward "\n\n" nil t)
+                        (search-forward "\r\n\r\n" nil t))
+                (shr-parse-image-data))))
+        (when buffer (kill-buffer buffer))))))
+
 (defun leman-room--render-html (string session)
   "Return rendered version of HTML STRING from SESSION.
 HTML is rendered to Emacs text using `shr-insert-document'."
@@ -4294,6 +4314,30 @@ HTML is rendered to Emacs text using `shr-insert-document'."
       (let ((shr-use-fonts leman-room-use-variable-pitch)
             (old-fn (symbol-function 'shr-tag-blockquote))) ;; Bind to a var to avoid unknown-function linting errors.
         (cl-letf (((symbol-function 'shr-fill-line) #'ignore)
+                  ;; NOTE: Replace `shr-tag-img' to fetch images
+                  ;; synchronously: shr's normal behavior inserts a
+                  ;; placeholder and downloads asynchronously, but the
+                  ;; render result is copied into the room buffer
+                  ;; before that could ever complete.
+                  ((symbol-function 'shr-tag-img)
+                   (lambda (dom &optional _url)
+                     (let* ((alt (or (dom-attr dom 'alt) ""))
+                            (url (and dom (or (dom-attr dom 'src)
+                                              (dom-attr dom 'srcset)))))
+                       (if-let* (((not shr-inhibit-images))
+                                 (url (and url (not (string-empty-p url))
+                                           (shr-expand-url url)))
+                                 (image (cond ((string-prefix-p "data:" url)
+                                               (shr-image-from-data
+                                                (substring url (length "data:"))))
+                                              ((not (shr-image-blocked-p url))
+                                               (leman-room--shr-image-data-sync url)))))
+                           (funcall shr-put-image-function
+                                    image alt
+                                    (list :width (shr-string-number (dom-attr dom 'width))
+                                          :height (shr-string-number (dom-attr dom 'height))))
+                         (shr-insert (if (string-empty-p (string-trim alt))
+                                         "*" (string-trim alt)))))))
                   ((symbol-function 'shr-tag-blockquote)
                    (lambda (dom)
                      (let ((beg (point-marker)))
