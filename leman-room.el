@@ -4057,6 +4057,52 @@ Formats according to `leman-room-message-format-spec', which see."
                  finally return (concat "\n  " (mapconcat #'format-reaction keys-senders "  ")))
       "")))
 
+(defun leman-room--propertize-margins ()
+  "Propertize margin text in current buffer."
+  (when leman-room--format-message-wrap-prefix
+    (when-let ((wrap-prefix-end (next-single-property-change (point-min) 'wrap-prefix-end)))
+      (goto-char wrap-prefix-end)
+      (delete-char 1)
+      (let* ((prefix-width (string-width (buffer-substring-no-properties
+                                          (line-beginning-position) (point))))
+             (prefix (propertize " " 'display `((space :width ,prefix-width)))))
+        ;; We apply the prefix to the entire event as `wrap-prefix', and to just the
+        ;; body as `line-prefix'.
+        (put-text-property (point-min) (point-max) 'wrap-prefix prefix)
+        (put-text-property (point) (point-max) 'line-prefix prefix))))
+  (when leman-room--format-message-margin-p
+    (when-let ((left-margin-end (next-single-property-change (point-min) 'left-margin-end)))
+      (goto-char left-margin-end)
+      (delete-char 1)
+      (let ((left-margin-text-width (string-width (buffer-substring-no-properties (point-min) (point)))))
+        ;; It would be preferable to not have to allocate a string to
+        ;; calculate the display width, but I don't know of another way.
+        (put-text-property (point-min) (point)
+                           'display `((margin left-margin)
+                                      ,(buffer-substring (point-min) (point))))
+        (save-excursion
+          (goto-char (point-min))
+          ;; Insert a string with a display specification that causes it to be displayed in the
+          ;; left margin as a space that displays with the width of the difference between the
+          ;; left margin's width and the display width of the text in the left margin (whew).
+          ;; This is complicated, but it seems to work (minus a possible Emacs/Gtk bug that
+          ;; sometimes causes the space to have a little "junk" displayed in it at times, but
+          ;; that's not our fault).  (And this is another example of how well-documented Emacs
+          ;; is: this was only possible by carefully reading the Elisp manual.)
+          (insert (propertize " " 'display `((margin left-margin)
+                                             (space :width (- left-margin ,left-margin-text-width))))))))
+    (when-let ((right-margin-start (next-single-property-change (point-min) 'right-margin-start)))
+      (goto-char right-margin-start)
+      (delete-char 1)
+      (let ((string (buffer-substring (point) (point-max))))
+        ;; Relocate its text to the beginning so it won't be
+        ;; displayed at the last line of wrapped messages.
+        (delete-region (point) (point-max))
+        (goto-char (point-min))
+        (insert-and-inherit
+         (propertize " "
+                     'display `((margin right-margin) ,string)))))))
+
 (cl-defun leman-room--format-message (event room session &optional (format leman-room-message-format-spec))
   "Return EVENT in ROOM on SESSION formatted according to FORMAT.
 Format defaults to `leman-room-message-format-spec', which see."
@@ -4064,93 +4110,54 @@ Format defaults to `leman-room-message-format-spec', which see."
   (let ((leman-room--format-message-margin-p)
         (left-margin-width leman-room-left-margin-width)
         (right-margin-width leman-room-right-margin-width))
-    ;; Copied from `format-spec'.
-    (with-current-buffer
-        (or (get-buffer " *leman-room--format-message*")
-            ;; TODO: Kill this buffer when disconnecting from all sessions.
-            (with-current-buffer (get-buffer-create " *leman-room--format-message*")
-              (setq buffer-undo-list t)
-              (current-buffer)))
-      (erase-buffer)
-      ;; Pretend this is a room buffer.
-      (setf leman-session session
-            leman-room room)
-      ;; HACK: Setting these buffer-locally in a temp buffer is ugly.
-      (setq-local leman-room-left-margin-width left-margin-width)
-      (setq-local leman-room-right-margin-width right-margin-width)
-      (insert format)
-      (goto-char (point-min))
-      (while (search-forward "%" nil t)
-        (cond
-         ((eq (char-after) ?%)
-          ;; Quoted percent sign.
-          (delete-char 1))
-         ((looking-at "\\([-0-9.]*\\)\\([a-zA-Z]\\)")
-          ;; Valid format spec.
-          (let* ((num (match-string 1))
-                 (spec (string-to-char (match-string 2)))
-                 (_
-                  ;; We delete the specifier now, because the formatter may change the
-                  ;; match data, and we already have what we need.
-                  (delete-region (1- (match-beginning 0)) (match-end 0)))
-                 (formatter (or (alist-get spec leman-room-event-formatters)
-                                (error "Invalid format character: `%%%c'" spec)))
-                 (val (or (funcall formatter event room session)
-                          (let ((print-level 1))
-                            (propertize (format "[Event has no value for spec \"?%s\"]" (char-to-string spec))
-                                        'face 'font-lock-comment-face
-                                        'help-echo (format "%S" event)))))
-                 ;; Pad result to desired length.
-                 (text (format (concat "%" num "s") val)))
-            (insert text)))
-         (t
-          ;; Signal an error on bogus format strings.
-          (error "leman-room--format-message: Invalid format string: %S" format))))
-      ;; Propertize margin text.
-      (when leman-room--format-message-wrap-prefix
-        (when-let ((wrap-prefix-end (next-single-property-change (point-min) 'wrap-prefix-end)))
-          (goto-char wrap-prefix-end)
-          (delete-char 1)
-          (let* ((prefix-width (string-width (buffer-substring-no-properties
-                                              (line-beginning-position) (point))))
-                 (prefix (propertize " " 'display `((space :width ,prefix-width)))))
-            ;; We apply the prefix to the entire event as `wrap-prefix', and to just the
-            ;; body as `line-prefix'.
-            (put-text-property (point-min) (point-max) 'wrap-prefix prefix)
-            (put-text-property (point) (point-max) 'line-prefix prefix))))
-      (when leman-room--format-message-margin-p
-        (when-let ((left-margin-end (next-single-property-change (point-min) 'left-margin-end)))
-          (goto-char left-margin-end)
-          (delete-char 1)
-          (let ((left-margin-text-width (string-width (buffer-substring-no-properties (point-min) (point)))))
-            ;; It would be preferable to not have to allocate a string to
-            ;; calculate the display width, but I don't know of another way.
-            (put-text-property (point-min) (point)
-                               'display `((margin left-margin)
-                                          ,(buffer-substring (point-min) (point))))
-            (save-excursion
-              (goto-char (point-min))
-              ;; Insert a string with a display specification that causes it to be displayed in the
-              ;; left margin as a space that displays with the width of the difference between the
-              ;; left margin's width and the display width of the text in the left margin (whew).
-              ;; This is complicated, but it seems to work (minus a possible Emacs/Gtk bug that
-              ;; sometimes causes the space to have a little "junk" displayed in it at times, but
-              ;; that's not our fault).  (And this is another example of how well-documented Emacs
-              ;; is: this was only possible by carefully reading the Elisp manual.)
-              (insert (propertize " " 'display `((margin left-margin)
-                                                 (space :width (- left-margin ,left-margin-text-width))))))))
-        (when-let ((right-margin-start (next-single-property-change (point-min) 'right-margin-start)))
-          (goto-char right-margin-start)
-          (delete-char 1)
-          (let ((string (buffer-substring (point) (point-max))))
-            ;; Relocate its text to the beginning so it won't be
-            ;; displayed at the last line of wrapped messages.
-            (delete-region (point) (point-max))
-            (goto-char (point-min))
-            (insert-and-inherit
-             (propertize " "
-                         'display `((margin right-margin) ,string))))))
-      (buffer-string))))
+    (cl-labels ((expand-format-spec ()
+                  ;; Copied from `format-spec'.
+                  (insert format)
+                  (goto-char (point-min))
+                  (while (search-forward "%" nil t)
+                    (cond
+                     ((eq (char-after) ?%)
+                      ;; Quoted percent sign.
+                      (delete-char 1))
+                     ((looking-at "\\([-0-9.]*\\)\\([a-zA-Z]\\)")
+                      ;; Valid format spec.
+                      (let* ((num (match-string 1))
+                             (spec (string-to-char (match-string 2)))
+                             (_
+                              ;; We delete the specifier now, because the formatter may change the
+                              ;; match data, and we already have what we need.
+                              (delete-region (1- (match-beginning 0)) (match-end 0)))
+                             (formatter (or (alist-get spec leman-room-event-formatters)
+                                            (error "Invalid format character: `%%%c'" spec)))
+                             (val (or (funcall formatter event room session)
+                                      (let ((print-level 1))
+                                        (propertize (format "[Event has no value for spec \"?%s\"]" (char-to-string spec))
+                                                    'face 'font-lock-comment-face
+                                                    'help-echo (format "%S" event)))))
+                             ;; Pad result to desired length.
+                             (text (format (concat "%" num "s") val)))
+                        (insert text)))
+                     (t
+                      ;; Signal an error on bogus format strings.
+                      (error "leman-room--format-message: Invalid format string: %S" format))))))
+      ;; Copied from `format-spec'.
+      (with-current-buffer
+          (or (get-buffer " *leman-room--format-message*")
+              ;; TODO: Kill this buffer when disconnecting from all sessions.
+              (with-current-buffer (get-buffer-create " *leman-room--format-message*")
+                (setq buffer-undo-list t)
+                (current-buffer)))
+        (erase-buffer)
+        ;; Pretend this is a room buffer.
+        (setf leman-session session
+              leman-room room)
+        ;; HACK: Setting these buffer-locally in a temp buffer is ugly.
+        (setq-local leman-room-left-margin-width left-margin-width)
+        (setq-local leman-room-right-margin-width right-margin-width)
+        (expand-format-spec)
+        ;; Propertize margin text.
+        (leman-room--propertize-margins)
+        (buffer-string)))))
 
 (cl-defun leman-room--format-message-body (event session &key (formatted-p t))
   "Return formatted body of \"m.room.message\" EVENT on SESSION.
