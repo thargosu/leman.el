@@ -5037,7 +5037,10 @@ See `leman-room-compose-history-isearch-push-state'."
                                                               ('membership prev-membership)
                                                               ('displayname prev-displayname))))))
                 event)
-               (sender-name (leman--user-displayname-in leman-room sender)))
+               (sender-name (leman--user-displayname-in leman-room sender))
+               (reason-suffix (if reason
+                                  (format " (%S)" reason)
+                                "")))
     (cl-macrolet ((nes (var)
                     ;; For "non-empty-string".  Needed because the displayname can be
                     ;; an empty string, but apparently is never null.  (Note that the
@@ -5056,7 +5059,11 @@ See `leman-room-compose-history-isearch-push-state'."
                                  'help-echo state-key))
                   (prev-displayname-id-string ()
                     `(propertize (or prev-displayname sender-name)
-                                 'help-echo (leman-user-id sender))))
+                                 'help-echo (leman-user-id sender)))
+                  (prev-displayname-state-key-string ()
+                    ;; The event's previous displayname, or the state key.
+                    `(propertize (or prev-displayname state-key)
+                                 'help-echo state-key)))
       (pcase-exhaustive new-membership
         ("invite"
          (pcase prev-membership
@@ -5106,48 +5113,33 @@ See `leman-room-compose-history-isearch-push-state'."
               ((pred (equal (leman-user-id sender)))
                (format "%s left%s"
                        (prev-displayname-id-string)
-                       (if reason
-                           (format " (%S)" reason)
-                         "")))
+                       reason-suffix))
               (_ (format "%s kicked %s%s"
                          (sender-name-id-string)
-                         (propertize (or prev-displayname state-key)
-                                     'help-echo state-key)
-                         (if reason
-                             (format " (%S)" reason)
-                           "")))))
+                         (prev-displayname-state-key-string)
+                         reason-suffix))))
            ("ban"
             (format "%s unbanned %s"
                     (sender-name-id-string)
                     state-key))
            (_ (format "%s left%s"
                       (prev-displayname-id-string)
-                      (if reason
-                          (format " (%S)" reason)
-                        "")))))
+                      reason-suffix))))
         ("ban"
          (pcase prev-membership
            ((or "invite" "leave")
             (format "%s banned %s%s"
                     (sender-name-id-string)
-                    (propertize (or prev-displayname state-key)
-                                'help-echo state-key)
-                    (if reason
-                        (format " (%S)" reason)
-                      "")))
+                    (prev-displayname-state-key-string)
+                    reason-suffix))
            ("join"
             (format "%s kicked and banned %s%s"
                     (sender-name-id-string)
-                    (propertize (or prev-displayname state-key)
-                                'help-echo state-key)
-                    (if reason
-                        (format " (%S)" reason)
-                      "")))
+                    (prev-displayname-state-key-string)
+                    reason-suffix))
            (_ (format "%s sent unrecognized ban event for %s"
                       (sender-name-id-string)
-                      (propertize (or prev-displayname state-key)
-                                  'help-echo state-key)))))))))
-
+                      (prev-displayname-state-key-string)))))))))
 ;; NOTE: Widgets are only currently used for single membership events, not grouped ones.
 
 (defun leman-room--pair-events (events others)
@@ -5432,6 +5424,61 @@ unauthenticated request to old endpoint."
     (leman--media-request mxc session :then then :else else
       :queue leman-images-queue :authenticatedp authenticatedp)))
 
+(defun leman-room--m.image-download-error (event session then plz-error)
+  "Handle PLZ-ERROR from a failed request to download EVENT's image on SESSION.
+THEN is the success continuation, to which the request may be
+retried unauthenticated if the server returns M_UNRECOGNIZED."
+  (pcase-let* (((cl-struct plz-error response
+                           (message plz-message)
+                           (curl-error `(,curl-exit-code . ,curl-message)))
+                plz-error)
+               (status (when (plz-response-p response)
+                         (plz-response-status response)))
+               (body (when (plz-response-p response)
+                       (plz-response-body response)))
+               (json-object (when body
+                              (ignore-errors
+                                (json-read-from-string body))))
+               (errcode (alist-get 'errcode json-object))
+               (error-message (format "%S: %s"
+                                      (or curl-exit-code status)
+                                      (or (when json-object
+                                            (alist-get 'error json-object))
+                                          curl-message
+                                          plz-message))))
+    (pcase errcode
+      ("M_UNRECOGNIZED"
+       ;; Resend unauthenticated media request for older servers.
+       ;; FIXME: Test the "/versions" endpoint to see what's supported.  See
+       ;; <https://matrix.org/blog/2024/06/20/matrix-v1.11-release/>.
+       (leman-room--image-download event session :authenticatedp nil
+         :then then))
+      (_ (signal 'leman-api-error (list error-message))))))
+
+(defun leman-room--image-max-sizes (buffer-window)
+  "Return (MAX-HEIGHT . MAX-WIDTH) for an image shown in BUFFER-WINDOW.
+Uses user options `leman-room-image-initial-height' and
+`leman-room-image-thumbnail-height-min'; if BUFFER-WINDOW is nil,
+uses the frame's size."
+  (let (max-height max-width)
+    (cond (leman-room-image-initial-height
+           ;; Use configured value.
+           (setf max-height (max leman-room-image-thumbnail-height-min
+                                 ;; Emacs doesn't like floats as the max-height.
+                                 (truncate
+                                  (* (window-body-height buffer-window t)
+                                     leman-room-image-initial-height)))
+                 max-width (window-body-width buffer-window t)))
+          (buffer-window
+           ;; Buffer displayed: use window size.
+           (setf max-height (window-body-height buffer-window t)
+                 max-width (window-body-width buffer-window t)))
+          (t
+           ;; Buffer not displayed: use frame size.
+           (setf max-height (frame-pixel-height)
+                 max-width (frame-pixel-width))))
+    (cons max-height max-width)))
+
 (defun leman-room--format-m.image (event session)
   "Return \"m.image\" EVENT on SESSION formatted as a string.
 When `leman-room-images' is non-nil, also download it and then
@@ -5445,72 +5492,30 @@ show it in the buffer."
                ;; TODO: Thumbnail support.
                ((map image) event-local)
                (then (apply-partially #'leman-room--m.image-callback event leman-room))
-               (else (lambda (plz-error)
-                       "Handle PLZ-ERROR for a failed request to download an image."
-                       (pcase-let* (((cl-struct plz-error response
-                                                (message plz-message)
-                                                (curl-error `(,curl-exit-code . ,curl-message)))
-                                     plz-error)
-                                    (status (when (plz-response-p response)
-                                              (plz-response-status response)))
-                                    (body (when (plz-response-p response)
-                                            (plz-response-body response)))
-                                    (json-object (when body
-                                                   (ignore-errors
-                                                     (json-read-from-string body))))
-                                    (errcode (alist-get 'errcode json-object))
-                                    (error-message (format "%S: %s"
-                                                           (or curl-exit-code status)
-                                                           (or (when json-object
-                                                                 (alist-get 'error json-object))
-                                                               curl-message
-                                                               plz-message))))
-                         (pcase errcode
-                           ("M_UNRECOGNIZED"
-                            ;; Resend unauthenticated media request for older servers.
-                            ;; FIXME: Test the "/versions" endpoint to see what's supported.  See
-                            ;; <https://matrix.org/blog/2024/06/20/matrix-v1.11-release/>.
-                            (leman-room--image-download event session :authenticatedp nil
-                              :then then))
-                           (_ (signal 'leman-api-error (list error-message))))))))
+               (else (apply-partially #'leman-room--m.image-download-error
+                                      event session then)))
     (if (and leman-room-images image)
         ;; Images enabled and image downloaded: create image and
         ;; return it in a string.
         (condition-case err
             (let ((image (create-image image nil 'data-p :ascent 'center))
                   (buffer-window (when buffer
-                                   (get-buffer-window buffer)))
-                  max-height max-width)
-              ;; Calculate max image display size.
-              (cond (leman-room-image-initial-height
-                     ;; Use configured value.
-                     (setf max-height (max leman-room-image-thumbnail-height-min
-                                           ;; Emacs doesn't like floats as the max-height.
-                                           (truncate
-                                            (* (window-body-height buffer-window t)
-                                               leman-room-image-initial-height)))
-                           max-width (window-body-width buffer-window t)))
-                    (buffer-window
-                     ;; Buffer displayed: use window size.
-                     (setf max-height (window-body-height buffer-window t)
-                           max-width (window-body-width buffer-window t)))
-                    (t
-                     ;; Buffer not displayed: use frame size.
-                     (setf max-height (frame-pixel-height)
-                           max-width (frame-pixel-width))))
-              (when (fboundp 'imagemagick-types)
-                ;; Only do this when ImageMagick is supported.
-                ;; FIXME: When requiring Emacs 27+, remove this (I guess?).
-                (setf (image-property image :type) 'imagemagick))
-              (setf (image-property image :max-width) max-width
-                    (image-property image :max-height) max-height
-                    (image-property image :relief) leman-room-image-relief
-                    (image-property image :margin) leman-room-image-margin
-                    (image-property image :pointer) 'hand)
-              (concat "\n"
-                      (leman-room-wrap-prefix " "
-                        'display image
-                        'keymap leman-room-image-keymap)))
+                                   (get-buffer-window buffer))))
+              (pcase-let ((`(,max-height . ,max-width)
+                           (leman-room--image-max-sizes buffer-window)))
+                (when (fboundp 'imagemagick-types)
+                  ;; Only do this when ImageMagick is supported.
+                  ;; FIXME: When requiring Emacs 27+, remove this (I guess?).
+                  (setf (image-property image :type) 'imagemagick))
+                (setf (image-property image :max-width) max-width
+                      (image-property image :max-height) max-height
+                      (image-property image :relief) leman-room-image-relief
+                      (image-property image :margin) leman-room-image-margin
+                      (image-property image :pointer) 'hand)
+                (concat "\n"
+                        (leman-room-wrap-prefix " "
+                          'display image
+                          'keymap leman-room-image-keymap))))
           (error (format "\n [error inserting image: %s]" (error-message-string err))))
       ;; Image not downloaded: insert URL as button, and download if enabled.
       (prog1
@@ -5533,7 +5538,6 @@ show it in the buffer."
           ;; Images enabled: download it.
           (leman-room--image-download event session
             :then then :else else))))))
-
 (defun leman-room--m.image-callback (event room data)
   "Add downloaded image from DATA to EVENT in ROOM.
 Then invalidate EVENT's node to show the image."
