@@ -2640,7 +2640,13 @@ the previously oldest event."
                ((cl-struct leman-room (id room-id)) room)
                (endpoint (format "rooms/%s/typing/%s"
                                  (url-hexify-string room-id) (url-hexify-string user-id)))
-               (data (leman-alist "typing" typing "timeout" 20000)))
+               ;; Encode a real JSON boolean: `nil' would encode as `null', which
+               ;; some servers (e.g. Conduit) reject because the spec requires a
+               ;; boolean for "typing".  Also, the timeout is meaningless when
+               ;; sending a not-typing notification, so it is omitted.
+               (data (if typing
+                         (leman-alist "typing" t "timeout" 20000)
+                       (leman-alist "typing" json-false))))
     (leman-api session endpoint :method 'put :data (json-encode data)
       ;; We don't really care about the response, I think.
       :then #'ignore)))
