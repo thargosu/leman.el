@@ -124,6 +124,7 @@ Used to, e.g. call `leman-room-compose-org'.")
 (declare-function leman-view-space "leman-directory")
 (declare-function leman-notify-switch-to-mentions-buffer "leman-notify")
 (declare-function leman-notify-switch-to-notifications-buffer "leman-notify")
+(declare-function leman--update-unread-indicator "leman.el")
 
 (defvar leman-room-mode-self-insert-keymap (make-sparse-keymap)
   "The `leman-room-mode' keymap under `leman-room-self-insert-mode'.
@@ -3474,7 +3475,8 @@ Interactively, mark both types as read up to event at point."
       (let ((request-process (leman-api session endpoint :method 'post :data (json-encode data)
                                :then (lambda (_data)
                                        (leman-room-move-read-markers room
-                                         :read-event read-event :fully-read-event fully-read-event))
+                                         :read-event read-event :fully-read-event fully-read-event)
+                                       (leman--update-unread-indicator))
                                :else (lambda (plz-error)
                                        (pcase (plz-error-message plz-error)
                                          ("curl process interrupted"

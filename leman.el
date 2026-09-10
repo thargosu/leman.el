@@ -667,6 +667,8 @@ Runs `leman-sync-callback-hook' with SESSION."
     (setf (leman-session-next-batch session) next-batch)
     ;; Run hooks which update buffers, etc.
     (run-hook-with-args 'leman-sync-callback-hook session)
+    ;; Update the mode-line unread indicator.
+    (leman--update-unread-indicator)
     ;; Show sync message if appropriate, and run after-initial-sync-hook.
     (when (leman--sync-messages-p session)
       (message (concat "Leman: Sync done."
@@ -1125,6 +1127,103 @@ To be called after initial sync."
           (dolist (child-id children)
             (when-let ((child-room (cl-find child-id rooms :key #'leman-room-id :test #'equal)))
               (cl-pushnew parent-id (alist-get 'parents (leman-room-local child-room)) :test #'equal))))))))
+
+;;;;; Transient
+
+(require 'transient)
+
+;; These files are not required by leman.el (leman-tabulated-room-list
+;; requires leman, so it cannot be required here), but their commands
+;; are autoloaded.
+(declare-function leman-list-rooms "leman-room-list")
+(declare-function leman-tabulated-room-list "leman-tabulated-room-list")
+(declare-function leman-directory "leman-directory")
+
+;;;###autoload
+(transient-define-prefix leman-transient ()
+  "Transient for Leman, callable from any buffer."
+  [:pad-keys t
+             ["Session"
+              ("c" "Connect" leman-connect)
+              ("d" "Disconnect" leman-disconnect)
+              ("K" "Kill Leman buffers" leman-kill-buffers)
+              ("P" "Set display name" leman-set-display-name)
+              ("S" "Sync now" leman-room-sync)]
+             ["Rooms"
+              ("l" "List rooms" leman-list-rooms)
+              ("t" "List rooms (tabulated)" leman-tabulated-room-list)
+              ("v" "View room" leman-view-room)
+              ("j" "Join room" leman-room-join)
+              ("N" "Create room" leman-create-room)
+              ("V" "View space" leman-view-space)]]
+  [:pad-keys t
+             ["Room actions"
+              ("i" "Invite user" leman-invite-user)
+              ("T" "Set topic" leman-room-set-topic)
+              ("f" "Tag room" leman-tag-room)
+              ("s" "Set notification state" leman-room-set-notification-state)
+              ("m" "Mark read to point" leman-room-mark-read)
+              ("L" "Leave room" leman-room-leave)
+              ("F" "Forget room" leman-forget-room)]
+             ["Notifications"
+              ("n" "Notifications" leman-notifications)
+              ("M" "Mentions" leman-notify-switch-to-mentions-buffer)
+              ("B" "Notifications buffer" leman-notify-switch-to-notifications-buffer)
+              ("u" "Ignore user" leman-ignore-user)]]
+  [:pad-keys t
+             ["Misc"
+              ("D" "Room directory" leman-directory)
+              ("o" "Occur search in room" leman-room-occur)
+              ("r" "Room transient" leman-room-transient)
+              ("C" "Flush colors" leman-room-flush-colors)
+              ("q" "Quit" transient-quit-one)]])
+
+;;;;; Unread indicator
+
+(defvar leman-unread-indicator-string nil
+  "String shown in the mode line by `leman-unread-indicator-mode'.
+Updated by `leman--update-unread-indicator'.")
+
+(defun leman--unread-counts ()
+  "Return cons of (NOTIFICATIONS . HIGHLIGHTS) unread counts.
+Counts are summed over joined rooms in all sessions.  They are
+the server-computed values, which account for each room's
+notification rules."
+  (let ((notifications 0)
+        (highlights 0))
+    (cl-loop for (_id . session) in leman-sessions
+             do (cl-loop for room in (leman-session-rooms session)
+                         when (eq 'join (leman-room-status room))
+                         do (pcase-let (((map notification_count highlight_count)
+                                         (leman-room-unread-notifications room)))
+                              (cl-incf notifications (or notification_count 0))
+                              (cl-incf highlights (or highlight_count 0)))))
+    (cons notifications highlights)))
+
+(defun leman--update-unread-indicator ()
+  "Update `leman-unread-indicator-string'.
+To be called after syncs and when read markers are moved."
+  (setf leman-unread-indicator-string
+        (if leman-sessions
+            (pcase-let ((`(,notifications . ,highlights) (leman--unread-counts)))
+              (concat (when (> notifications 0)
+                        (propertize (format "L:%d" notifications) 'face 'bold))
+                      (when (> highlights 0)
+                        (propertize (format "(%d)" highlights) 'face 'leman-room-mention))))
+          "")))
+
+(define-minor-mode leman-unread-indicator-mode
+  "Show unread notification counts in the mode line.
+Counts are updated after each sync and when read markers are
+moved.  Highlights (i.e. mentions) are shown in parentheses."
+  :global t
+  :group 'leman
+  (if leman-unread-indicator-mode
+      (progn
+        (add-to-list 'global-mode-string 'leman-unread-indicator-string)
+        (leman--update-unread-indicator))
+    (setq global-mode-string (delq 'leman-unread-indicator-string global-mode-string))
+    (setf leman-unread-indicator-string nil)))
 
 ;;;;; Savehist compatibility
 
