@@ -517,6 +517,73 @@ If no URI is found, prompt the user for the hostname."
       (error (warn "Leman: `plz' request for .well-known URI signaled an error: %S" err)
              (fail-prompt)))))
 
+(defun leman--sync-maybe-interrupt (session force)
+  "Interrupt any outstanding sync for SESSION.
+If FORCE is nil, signal an error instead."
+  (when (map-elt leman-syncs session)
+    (if force
+        (condition-case err
+            (delete-process (map-elt leman-syncs session))
+          ;; Ensure the only error is the expected one from deleting the process.
+          (leman-api-error (cl-assert (equal "curl process killed" (plz-error-message (cl-third err))))
+                           (message "Leman: Forcing new sync")))
+      (user-error "Leman: Already syncing this session"))))
+
+(defun leman--sync-params (next-batch filter)
+  "Return query parameters for a sync request for NEXT-BATCH and FILTER."
+  ;; TODO: Document filter arg.
+  (remove
+   nil (list (list "full_state" (if next-batch "false" "true"))
+             (when filter
+               (list "filter" (json-encode filter)))
+             (when next-batch
+               (list "since" next-batch))
+             (when next-batch
+               (list "timeout" "30000")))))
+
+(defun leman--sync-failed (session timeout plz-error)
+  "Handle a failed sync request for SESSION.
+TIMEOUT is the request's timeout, which is used when re-syncing.
+PLZ-ERROR is the error passed by `plz'."
+  (setf (map-elt leman-syncs session) nil)
+  ;; TODO: plz probably needs nicer error handling.
+  ;; Ideally we would use `condition-case', but since the error is
+  ;; signaled in `plz--sentinel'...
+  (pcase-let* (((cl-struct plz-error curl-error response) plz-error)
+               (reason))
+    (cond ((when response
+             (pcase (plz-response-status response)
+               ((or 429 502) (setf reason "failed")))))
+          ((pcase curl-error
+             (`(28 . ,_) (setf reason "timed out")))))
+    (if reason
+        (if (not leman-auto-sync)
+            (run-hook-with-args 'leman-interrupted-sync-hook session)
+          (message "Leman: Sync %s (%s).  Syncing again..."
+                   reason (leman-user-id (leman-session-user session)))
+          ;; Set QUIET to allow the just-printed message to remain visible.
+          (leman--sync session :timeout timeout :quiet t))
+      ;; Unrecognized errors:
+      (pcase curl-error
+        (`(,code . ,message)
+         (signal 'leman-api-error (list (format "Leman: Network error: %s: %s" code message)
+                                        plz-error)))
+        (_ (signal 'leman-api-error (list "Leman: Unrecognized network error" plz-error)))))))
+
+(defun leman--sync-read-json (session sync-start-time)
+  "Print a message, then parse the sync response for SESSION.
+Called in the buffer holding the response; SYNC-START-TIME is the
+time the request was sent, used for progress messages."
+  (when (leman--sync-messages-p session)
+    (message "Leman: Response arrived after %.2f seconds.  Reading %s JSON response..."
+             (- (time-to-seconds) sync-start-time)
+             (file-size-human-readable (buffer-size))))
+  (let ((start-time (time-to-seconds)))
+    (prog1 (leman--json-parse-buffer)
+      (when (leman--sync-messages-p session)
+        (message "Leman: Reading JSON took %.2f seconds"
+                 (- (time-to-seconds) start-time))))))
+
 (cl-defun leman--sync (session &key force quiet
                                (timeout 40) ;; Give the server an extra 10 seconds.
                                (filter leman-default-sync-filter))
@@ -535,65 +602,18 @@ a filter ID).  When unspecified, the value of
   ;; TODO: Use a filter ID for default filter.
   ;; TODO: Optionally, automatically sync again when HTTP request fails.
   ;; TODO: Ensure that the process in (map-elt leman-syncs session) is live.
-  (when (map-elt leman-syncs session)
-    (if force
-        (condition-case err
-            (delete-process (map-elt leman-syncs session))
-          ;; Ensure the only error is the expected one from deleting the process.
-          (leman-api-error (cl-assert (equal "curl process killed" (plz-error-message (cl-third err))))
-                           (message "Leman: Forcing new sync")))
-      (user-error "Leman: Already syncing this session")))
+  (leman--sync-maybe-interrupt session force)
   (pcase-let* (((cl-struct leman-session next-batch) session)
-               (params (remove
-                        nil (list (list "full_state" (if next-batch "false" "true"))
-                                  (when filter
-                                    ;; TODO: Document filter arg.
-                                    (list "filter" (json-encode filter)))
-                                  (when next-batch
-                                    (list "since" next-batch))
-                                  (when next-batch
-                                    (list "timeout" "30000")))))
+               (params (leman--sync-params next-batch filter))
                (sync-start-time (time-to-seconds))
                ;; FIXME: Auto-sync again in error handler.
                (process (leman-api session "sync" :params params
                           :timeout timeout
                           :then (apply-partially #'leman--sync-callback session)
                           :else (lambda (plz-error)
-                                  (setf (map-elt leman-syncs session) nil)
-                                  ;; TODO: plz probably needs nicer error handling.
-                                  ;; Ideally we would use `condition-case', but since the
-                                  ;; error is signaled in `plz--sentinel'...
-                                  (pcase-let (((cl-struct plz-error curl-error response) plz-error)
-                                              (reason))
-                                    (cond ((when response
-                                             (pcase (plz-response-status response)
-                                               ((or 429 502) (setf reason "failed")))))
-                                          ((pcase curl-error
-                                             (`(28 . ,_) (setf reason "timed out")))))
-                                    (if reason
-                                        (if (not leman-auto-sync)
-                                            (run-hook-with-args 'leman-interrupted-sync-hook session)
-                                          (message "Leman: Sync %s (%s).  Syncing again..."
-                                                   reason (leman-user-id (leman-session-user session)))
-                                          ;; Set QUIET to allow the just-printed message to remain visible.
-                                          (leman--sync session :timeout timeout :quiet t))
-                                      ;; Unrecognized errors:
-                                      (pcase curl-error
-                                        (`(,code . ,message)
-                                         (signal 'leman-api-error (list (format "Leman: Network error: %s: %s" code message)
-                                                                        plz-error)))
-                                        (_ (signal 'leman-api-error (list "Leman: Unrecognized network error" plz-error)))))))
+                                  (leman--sync-failed session timeout plz-error))
                           :json-read-fn (lambda ()
-                                          "Print a message, then call `leman--json-parse-buffer'."
-                                          (when (leman--sync-messages-p session)
-                                            (message "Leman: Response arrived after %.2f seconds.  Reading %s JSON response..."
-                                                     (- (time-to-seconds) sync-start-time)
-                                                     (file-size-human-readable (buffer-size))))
-                                          (let ((start-time (time-to-seconds)))
-                                            (prog1 (leman--json-parse-buffer)
-                                              (when (leman--sync-messages-p session)
-                                                (message "Leman: Reading JSON took %.2f seconds"
-                                                         (- (time-to-seconds) start-time)))))))))
+                                          (leman--sync-read-json session sync-start-time)))))
     (when process
       (setf (map-elt leman-syncs session) process)
       (when (and (not quiet) (leman--sync-messages-p session))
