@@ -1180,61 +1180,96 @@ To be called after initial sync."
 
 ;;;;; Unread indicator
 
+(defcustom leman-unread-indicator-max-rooms 3
+  "Number of room names shown inline in the unread indicator.
+If nil, the indicator shows only counts; in either case, its
+help-echo lists every room with unread notifications."
+  :type '(choice (const :tag "Counts only" nil)
+                 (natnum :tag "Number of room names")))
+
 (defvar leman-unread-indicator-string nil
   "String shown in the mode line by `leman-unread-indicator-mode'.
 Updated by `leman--update-unread-indicator'.")
 (put 'leman-unread-indicator-string 'risky-local-variable t)
 
-(defun leman--unread-counts ()
-  "Return cons of (NOTIFICATIONS . HIGHLIGHTS) unread counts.
-Counts are summed over joined rooms in all sessions.  They are
-the server-computed values, which account for each room's
-notification rules."
-  (let ((notifications 0)
-        (highlights 0))
-    (cl-loop for (_id . session) in leman-sessions
-             do (cl-loop for room in (leman-session-rooms session)
-                         when (eq 'join (leman-room-status room))
-                         do (pcase-let (((map notification_count highlight_count)
-                                         (leman-room-unread-notifications room)))
-                              (cl-incf notifications (or notification_count 0))
-                              (cl-incf highlights (or highlight_count 0)))))
-    (cons notifications highlights)))
+(defvar leman-unread-indicator-keymap
+  (let ((map (make-sparse-keymap)))
+    ;; Bind down- events so that the global keymap won't "shine
+    ;; through".
+    (define-key map [mode-line down-mouse-1] #'ignore)
+    (define-key map [mode-line mouse-1] #'leman-unread-indicator-click)
+    map)
+  "Keymap for clicks on the unread indicator.")
 
-(defun leman--unread-help-echo ()
-  "Return a help-echo string summarizing rooms with unread counts."
-  (string-join
+(defun leman--unread-rooms ()
+  "Return conses of (ROOM . SESSION) for joined unread rooms.
+Sorted by notification count, most first."
+  (sort
    (cl-loop for (_id . session) in leman-sessions
             append (cl-loop for room in (leman-session-rooms session)
                             for notifications = (map-elt (leman-room-unread-notifications room)
                                                          'notification_count 0)
                             when (and (eq 'join (leman-room-status room))
                                       (> notifications 0))
-                            collect (format "%s: %d%s"
-                                            (or (leman-room-display-name room)
-                                                (leman-room-id room))
-                                            notifications
-                                            (if-let ((highlights (map-elt (leman-room-unread-notifications room)
-                                                                          'highlight_count 0)))
-                                                (format " (%d highlights)" highlights)
-                                              "")))
-            into lines
-            finally return lines)
-   "\n"))
+                            collect (cons room session)))
+   (lambda (a b)
+     (> (map-elt (leman-room-unread-notifications (car a)) 'notification_count 0)
+        (map-elt (leman-room-unread-notifications (car b)) 'notification_count 0)))))
+
+(defun leman--unread-help-echo ()
+  "Return a help-echo string summarizing rooms with unread counts."
+  (concat
+   (string-join
+    (cl-loop for (room . _session) in (leman--unread-rooms)
+             for notifications = (map-elt (leman-room-unread-notifications room) 'notification_count 0)
+             collect (format "%s: %d%s"
+                             (or (leman-room-display-name room) (leman-room-id room))
+                             notifications
+                             (if-let ((highlights (map-elt (leman-room-unread-notifications room) 'highlight_count 0)))
+                                 (format " (%d highlights)" highlights)
+                               "")))
+    "\n")
+   "\n(mouse-1: view room with most unread notifications)"))
+
+(defun leman--unread-room-names (max)
+  "Return up to MAX unread room names with their counts."
+  (cl-loop for i from 1
+           for (room . _session) in (leman--unread-rooms)
+           while (<= i max)
+           collect (format "%s %s"
+                           (or (leman-room-display-name room)
+                               (leman-room-id room))
+                           (map-elt (leman-room-unread-notifications room) 'notification_count 0))))
+
+(defun leman-unread-indicator-click (_event)
+  "View the room with the most unread notifications."
+  (interactive "e")
+  (if-let* ((rooms (leman--unread-rooms))
+            (found (car rooms)))
+      (pcase-let ((`(,room . ,session) found))
+        (leman-view-room room session))
+    (message "No unread rooms")))
 
 (defun leman--update-unread-indicator ()
   "Update `leman-unread-indicator-string'.
 To be called after syncs and when read markers are moved."
   (setf leman-unread-indicator-string
-        (if leman-sessions
-            (pcase-let ((`(,notifications . ,highlights) (leman--unread-counts)))
-              (when (or (> notifications 0) (> highlights 0))
-                (propertize
-                 (concat (when (> notifications 0)
-                           (propertize (format "L:%d" notifications) 'face 'bold))
-                         (when (> highlights 0)
-                           (propertize (format "(%d)" highlights) 'face 'leman-room-mention)))
-                 'help-echo (leman--unread-help-echo))))
+        (if-let* ((rooms (leman--unread-rooms))
+                  (notifications (cl-loop for (room . _) in rooms
+                                          sum (map-elt (leman-room-unread-notifications room) 'notification_count 0)))
+                  (highlights (cl-loop for (room . _) in rooms
+                                       sum (map-elt (leman-room-unread-notifications room) 'highlight_count 0))))
+            (propertize
+             (concat
+              (propertize (format "✉ %d" notifications) 'face 'bold)
+              (when (> highlights 0)
+                (propertize (format " @%d" highlights) 'face 'leman-room-mention))
+              (when-let* ((max-rooms leman-unread-indicator-max-rooms)
+                          (names (leman--unread-room-names max-rooms)))
+                (concat " (" (string-join names ", ") ")")))
+             'help-echo (leman--unread-help-echo)
+             'mouse-face 'mode-line-highlight
+             'local-map leman-unread-indicator-keymap)
           "")))
 
 (define-minor-mode leman-unread-indicator-mode
