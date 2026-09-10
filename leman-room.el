@@ -4211,9 +4211,9 @@ If FORMATTED-P, return the formatted body content, when available."
                          ;; Copy the string so as not to add face properties to the one in the struct.
                          (copy-sequence body)
                        (pcase (or new-content-format content-format)
-                         ("org.matrix.custom.html"
-                          (save-match-data
-                            (leman-room--render-html formatted-body)))
+                          ("org.matrix.custom.html"
+                           (save-match-data
+                             (leman-room--render-html formatted-body session)))
                          (_ (format "[unknown body format: %s] %s"
                                     (or new-content-format content-format) body)))))
                (appendix (pcase msgtype
@@ -4255,8 +4255,25 @@ If FORMATTED-P, return the formatted body content, when available."
       (setf body "[redacted]"))
     body))
 
-(defun leman-room--render-html (string)
-  "Return rendered version of HTML STRING.
+(defun leman-room--rewrite-mxc-imgs (dom session)
+  "Rewrite mxc:// SRC attributes in parsed HTML DOM to media URLs.
+URLs are built with `leman--mxc-to-url' for SESSION so that shr
+can download and display the images (e.g. custom emoji inserted
+by bridges).  Returns DOM."
+  (pcase dom
+    (`(,_ ,attrs . ,children)
+     (when-let ((src (and (consp attrs)
+                          (alist-get 'src attrs))))
+       (when (string-prefix-p "mxc://" src)
+         (setcdr (assq 'src attrs)
+                 (leman--mxc-to-url src session))))
+     (dolist (child children)
+       (when (consp child)
+         (leman-room--rewrite-mxc-imgs child session)))))
+  dom)
+
+(defun leman-room--render-html (string session)
+  "Return rendered version of HTML STRING from SESSION.
 HTML is rendered to Emacs text using `shr-insert-document'."
   (with-current-buffer
       (or (get-buffer " *leman-room--render-html*")
@@ -4287,7 +4304,8 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                        ;; NOTE: We use our own gv, `leman-text-property'; very convenient.
                        (add-face-text-property beg (point-max) 'leman-room-quote 'append)))))
           (shr-insert-document
-           (libxml-parse-html-region (point-min) (point-max))))))
+           (leman-room--rewrite-mxc-imgs
+            (libxml-parse-html-region (point-min) (point-max)) session)))))
     (string-trim (buffer-substring (point) (point-max)))))
 
 (cl-defun leman-room--event-mentions-user-p (event user &optional (room leman-room))
