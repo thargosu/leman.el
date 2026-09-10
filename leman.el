@@ -1244,9 +1244,15 @@ moved.  Highlights (i.e. mentions) are shown in parentheses."
   :group 'leman
   (if leman-unread-indicator-mode
       (progn
+        ;; Register in `global-mode-string' (shown in the default
+        ;; `mode-line-misc-info') and directly in `mode-line-misc-info',
+        ;; in case the user's configuration omits `global-mode-string'
+        ;; from it.
         (add-to-list 'global-mode-string 'leman-unread-indicator-string)
+        (add-to-list 'mode-line-misc-info 'leman-unread-indicator-string)
         (leman--update-unread-indicator))
-    (setq global-mode-string (delq 'leman-unread-indicator-string global-mode-string))
+    (setq global-mode-string (delq 'leman-unread-indicator-string global-mode-string)
+          mode-line-misc-info (delq 'leman-unread-indicator-string mode-line-misc-info))
     (setf leman-unread-indicator-string nil)))
 
 ;;;;; Savehist compatibility
