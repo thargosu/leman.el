@@ -1824,8 +1824,12 @@ buffer).  It receives two arguments, the room and the session."
            ;; synapse (arbitrary unicode isn't intentionally allowed,
            ;; but it's not disallowed either)".  See
            ;; <https://matrix.to/#/!jxlRxnrZCsjpjDubDX:matrix.org/$Cnb53UQdYnGFizM49Aje_Xs0BxVdt-be7Dnm7_k-0ho>.
+           ;; Also, some homeservers (e.g. Conduit) generate room IDs
+           ;; without a server name part, so the server part is
+           ;; optional; the server still does the authoritative
+           ;; validation.
            (rx bos (or "#" "!") (1+ (not (any ":")))
-               ":" (1+ (or alnum (any "-."))))
+               (optional ":" (1+ (not (any ":")))))
            id-or-alias)
     (user-error "Invalid room ID or alias (use, e.g. \"#ROOM-ALIAS:SERVER\")"))
   (let ((endpoint (format "join/%s" (url-hexify-string id-or-alias))))
