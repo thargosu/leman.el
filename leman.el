@@ -1200,16 +1200,40 @@ notification rules."
                               (cl-incf highlights (or highlight_count 0)))))
     (cons notifications highlights)))
 
+(defun leman--unread-help-echo ()
+  "Return a help-echo string summarizing rooms with unread counts."
+  (string-join
+   (cl-loop for (_id . session) in leman-sessions
+            append (cl-loop for room in (leman-session-rooms session)
+                            for notifications = (map-elt (leman-room-unread-notifications room)
+                                                         'notification_count 0)
+                            when (and (eq 'join (leman-room-status room))
+                                      (> notifications 0))
+                            collect (format "%s: %d%s"
+                                            (or (leman-room-display-name room)
+                                                (leman-room-id room))
+                                            notifications
+                                            (if-let ((highlights (map-elt (leman-room-unread-notifications room)
+                                                                          'highlight_count 0)))
+                                                (format " (%d highlights)" highlights)
+                                              "")))
+            into lines
+            finally return lines)
+   "\n"))
+
 (defun leman--update-unread-indicator ()
   "Update `leman-unread-indicator-string'.
 To be called after syncs and when read markers are moved."
   (setf leman-unread-indicator-string
         (if leman-sessions
             (pcase-let ((`(,notifications . ,highlights) (leman--unread-counts)))
-              (concat (when (> notifications 0)
-                        (propertize (format "L:%d" notifications) 'face 'bold))
-                      (when (> highlights 0)
-                        (propertize (format "(%d)" highlights) 'face 'leman-room-mention))))
+              (when (or (> notifications 0) (> highlights 0))
+                (propertize
+                 (concat (when (> notifications 0)
+                           (propertize (format "L:%d" notifications) 'face 'bold))
+                         (when (> highlights 0)
+                           (propertize (format "(%d)" highlights) 'face 'leman-room-mention)))
+                 'help-echo (leman--unread-help-echo))))
           "")))
 
 (define-minor-mode leman-unread-indicator-mode
