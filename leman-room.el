@@ -5157,109 +5157,112 @@ EVENTS events having that state-key are dropped."
                (push event remaining-events)))))
     (list (nreverse paired-others) (nreverse remaining-events) remaining-others)))
 
-(defun leman-room--format-membership-events (struct room)
-  "Return string for STRUCT in ROOM.
-STRUCT should be an `leman-room-membership-events' struct."
+(defun leman-room--membership-summary-type (event)
+  "Return the summary type for \"m.room.member\" EVENT's membership change.
+Return nil when the event should not be shown in a summary."
+  (let ((old (map-nested-elt (leman-event-unsigned event) '(prev_content membership)))
+        (new (alist-get 'membership (leman-event-content event))))
+    (cond ((equal new "join")
+           (cond ((equal old "join")
+                  (if (not (equal (alist-get 'avatar_url (leman-event-content event))
+                                  (map-nested-elt (leman-event-unsigned event)
+                                                  '(prev_content avatar_url))))
+                      "changed avatar"
+                    "changed name"))
+                 ((equal old "leave") "rejoined")
+                 (t "joined")))
+          ((equal new "leave")
+           (cond ((equal old "ban") "unbanned")
+                 ((equal old "invite") "rejected invitation")
+                 (t "left")))
+          ((equal new "invite") "invited")
+          ((equal new "ban")
+           (cond ((equal old "join") "kicked and banned")
+                 ((member old '("invite" "leave")) "banned"))))))
+
+(defun leman-room--membership-kicked-p (event)
+  "Return non-nil if \"m.room.member\" EVENT is a kick.
+I.e. the user was kicked by another user, rather than leaving on
+their own."
+  (and (equal "join" (map-nested-elt (leman-event-unsigned event) '(prev_content membership)))
+       (equal "leave" (alist-get 'membership (leman-event-content event)))
+       (not (equal (leman-user-id (leman-event-sender event))
+                   (leman-event-state-key event)))))
+
+(defun leman-room--format-membership-summary (events room)
+  "Return summary string for \"m.room.member\" EVENTS in ROOM.
+EVENTS should contain more than one event."
   (cl-labels ((event-user (event)
                 (propertize (if-let (user (gethash (leman-event-state-key event) leman-users))
                                 (leman--user-displayname-in room user)
                               (leman-event-state-key event))
                             'help-echo (concat (leman-room--format-member-event event room)
                                                " <" (leman-event-state-key event) ">")))
-              (old-membership (event)
-                (map-nested-elt (leman-event-unsigned event) '(prev_content membership)))
-              (new-membership (event)
-                (alist-get 'membership (leman-event-content event)))
-              (avatar-url-changed-p (event)
-                (not (equal (alist-get 'avatar_url (leman-event-content event))
-                            (map-nested-elt (leman-event-unsigned event)
-                                            '(prev_content avatar_url)))))
-              (kicked-p (event)
-                ;; Kicked by another user, rather than leaving on their own.
-                (and (equal "join" (old-membership event))
-                     (equal "leave" (new-membership event))
-                     (not (equal (leman-user-id (leman-event-sender event))
-                                 (leman-event-state-key event)))))
-              (classify (event)
-                ;; Return the summary type for EVENT's membership change, or nil when
-                ;; the event should not be shown in the summary.
-                (let ((old (old-membership event))
-                      (new (new-membership event)))
-                  (cond ((equal new "join")
-                         (cond ((equal old "join")
-                                (if (avatar-url-changed-p event)
-                                    "changed avatar"
-                                  "changed name"))
-                               ((equal old "leave") "rejoined")
-                               (t "joined")))
-                        ((equal new "leave")
-                         (cond ((equal old "ban") "unbanned")
-                               ((equal old "invite") "rejected invitation")
-                               (t "left")))
-                        ((equal new "invite") "invited")
-                        ((equal new "ban")
-                         (cond ((equal old "join") "kicked and banned")
-                               ((member old '("invite" "leave")) "banned"))))))
               (state-key-in (events)
                 (lambda (event)
                   (cl-find (leman-event-state-key event) events
                            :test #'equal :key #'leman-event-state-key))))
-    (pcase-let* (((cl-struct leman-room-membership-events events) struct))
-      (pcase (length events)
-        (0 (warn "No events in `leman-room-membership-events' struct"))
-        (1 (leman-room--format-member-event (car events) room))
-        (_ (let* ((kicked-events (cl-remove-if-not #'kicked-p events))
-                  (buckets (let (buckets)
-                             (dolist (event events)
-                               (when-let ((type (classify event)))
-                                 (push event (alist-get type buckets nil nil #'equal))))
-                             ;; The buckets were built by pushing, which
-                             ;; reverses the events' order; restore it.
-                             (cl-loop for (type . bucket-events) in buckets
-                                      collect (cons type (nreverse bucket-events)))))
-                  (rejoin-events (alist-get "rejoined" buckets nil nil #'equal))
-                  (join-events (alist-get "joined" buckets nil nil #'equal))
-                  (left-events (alist-get "left" buckets nil nil #'equal))
-                  ;; Events that are both joined and rejoined are counted as rejoined.
-                  (join-events (cl-delete-if (state-key-in rejoin-events) join-events)))
-             ;; Joins followed by a leave are counted as "joined and left".
-             (pcase-let ((`(,joined-and-left-events ,join-events ,left-events)
-                          (leman-room--pair-events join-events left-events)))
-               ;; Rejoins following a kick are counted as "was kicked and rejoined"; the
-               ;; paired kicks are also removed from the left events, in which they would
-               ;; otherwise be counted as merely leaving.
-               (pcase-let ((`(,kicked-and-rejoined-events ,rejoin-events _)
-                            (leman-room--pair-events rejoin-events kicked-events)))
-                 ;; Remaining rejoins followed by a leave are counted as "rejoined and left".
-                 (pcase-let ((`(,rejoined-and-left-events ,rejoin-events ,left-events)
-                              (leman-room--pair-events
-                               rejoin-events
-                               (cl-delete-if (state-key-in kicked-and-rejoined-events)
-                                             left-events))))
-                   (format "Membership: %s."
-                           (string-join
-                            (cl-loop for (type . events)
-                                     in (leman-alist "rejoined" rejoin-events
-                                                     "joined" join-events
-                                                     "left" left-events
-                                                     "joined and left" joined-and-left-events
-                                                     "was kicked and rejoined" kicked-and-rejoined-events
-                                                     "rejoined and left" rejoined-and-left-events
-                                                     "invited" (alist-get "invited" buckets nil nil #'equal)
-                                                     "rejected invitation" (alist-get "rejected invitation" buckets nil nil #'equal)
-                                                     "banned" (alist-get "banned" buckets nil nil #'equal)
-                                                     "unbanned" (alist-get "unbanned" buckets nil nil #'equal)
-                                                     "kicked and banned" (alist-get "kicked and banned" buckets nil nil #'equal)
-                                                     "changed name" (alist-get "changed name" buckets nil nil #'equal)
-                                                     "changed avatar" (alist-get "changed avatar" buckets nil nil #'equal))
-                                     for users = (mapcar #'event-user
-                                                         (cl-delete-duplicates
-                                                          events :key #'leman-event-state-key))
-                                     when events
-                                     collect (format "%s %s (%s)" (length users)
-                                                     (propertize type 'face 'bold)
-                                                     (string-join users ", ")))
-                            "; ")))))))))))
+    (let* ((kicked-events (cl-remove-if-not #'leman-room--membership-kicked-p events))
+           (buckets (let (buckets)
+                      (dolist (event events)
+                        (when-let ((type (leman-room--membership-summary-type event)))
+                          (push event (alist-get type buckets nil nil #'equal))))
+                      ;; The buckets were built by pushing, which
+                      ;; reverses the events' order; restore it.
+                      (cl-loop for (type . bucket-events) in buckets
+                               collect (cons type (nreverse bucket-events)))))
+           (rejoin-events (alist-get "rejoined" buckets nil nil #'equal))
+           (join-events (alist-get "joined" buckets nil nil #'equal))
+           (left-events (alist-get "left" buckets nil nil #'equal))
+           ;; Events that are both joined and rejoined are counted as rejoined.
+           (join-events (cl-delete-if (state-key-in rejoin-events) join-events)))
+      ;; Joins followed by a leave are counted as "joined and left"; rejoins
+      ;; following a kick are counted as "was kicked and rejoined", and the
+      ;; paired kicks are removed from the left events, in which they would
+      ;; otherwise be counted as merely leaving; and remaining rejoins
+      ;; followed by a leave are counted as "rejoined and left".
+      (pcase-let* ((`(,joined-and-left-events ,join-events ,left-events)
+                    (leman-room--pair-events join-events left-events))
+                   (`(,kicked-and-rejoined-events ,rejoin-events _)
+                    (leman-room--pair-events rejoin-events kicked-events))
+                   (`(,rejoined-and-left-events ,rejoin-events ,left-events)
+                    (leman-room--pair-events
+                     rejoin-events
+                     (cl-delete-if (state-key-in kicked-and-rejoined-events)
+                                   left-events))))
+        (format "Membership: %s."
+                (string-join
+                 (cl-loop for (type . events)
+                          in (leman-alist "rejoined" rejoin-events
+                                          "joined" join-events
+                                          "left" left-events
+                                          "joined and left" joined-and-left-events
+                                          "was kicked and rejoined" kicked-and-rejoined-events
+                                          "rejoined and left" rejoined-and-left-events
+                                          "invited" (alist-get "invited" buckets nil nil #'equal)
+                                          "rejected invitation" (alist-get "rejected invitation" buckets nil nil #'equal)
+                                          "banned" (alist-get "banned" buckets nil nil #'equal)
+                                          "unbanned" (alist-get "unbanned" buckets nil nil #'equal)
+                                          "kicked and banned" (alist-get "kicked and banned" buckets nil nil #'equal)
+                                          "changed name" (alist-get "changed name" buckets nil nil #'equal)
+                                          "changed avatar" (alist-get "changed avatar" buckets nil nil #'equal))
+                          for users = (mapcar #'event-user
+                                              (cl-delete-duplicates
+                                               events :key #'leman-event-state-key))
+                          when events
+                          collect (format "%s %s (%s)" (length users)
+                                          (propertize type 'face 'bold)
+                                          (string-join users ", ")))
+                 "; "))))))
+
+(defun leman-room--format-membership-events (struct room)
+  "Return string for STRUCT in ROOM.
+STRUCT should be an `leman-room-membership-events' struct."
+  (pcase-let* (((cl-struct leman-room-membership-events events) struct))
+    (pcase (length events)
+      (0 (warn "No events in `leman-room-membership-events' struct"))
+      (1 (leman-room--format-member-event (car events) room))
+      (_ (leman-room--format-membership-summary events room)))))
 
 ;;;;; Images
 
