@@ -1183,6 +1183,7 @@ To be called after initial sync."
 (defvar leman-unread-indicator-string nil
   "String shown in the mode line by `leman-unread-indicator-mode'.
 Updated by `leman--update-unread-indicator'.")
+(put 'leman-unread-indicator-string 'risky-local-variable t)
 
 (defun leman--unread-counts ()
   "Return cons of (NOTIFICATIONS . HIGHLIGHTS) unread counts.
