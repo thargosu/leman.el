@@ -4312,33 +4312,43 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                    (lambda (dom &optional _url)
                      (let* ((alt (or (dom-attr dom 'alt) ""))
                             (src (and dom (or (dom-attr dom 'src)
-                                              (dom-attr dom 'srcset)))))
-                       (cond
-                        ((and src (string-prefix-p "mxc://" src) session)
-                         (let ((image (leman-room--shr-image-data-sync
-                                       (leman--mxc-to-authenticated-url src session)
-                                       (leman-session-token session))))
-                           (if image
-                               (funcall shr-put-image-function
-                                        image alt
-                                        (list :width (shr-string-number (dom-attr dom 'width))
-                                              :height (shr-string-number (dom-attr dom 'height))))
-                             (shr-insert (or (string-trim alt) "*")))))
-                        ((and src (not (string-empty-p src))
-                              (not shr-inhibit-images)
-                              (not (shr-image-blocked-p (shr-expand-url src))))
-                         (let* ((url (shr-expand-url src))
-                                (image (if (string-prefix-p "data:" url)
-                                           (shr-image-from-data (substring url (length "data:")))
-                                         (leman-room--shr-image-data-sync url))))
-                           (if image
-                               (funcall shr-put-image-function
-                                        image alt
-                                        (list :width (shr-string-number (dom-attr dom 'width))
-                                              :height (shr-string-number (dom-attr dom 'height))))
-                             (shr-insert (or (string-trim alt) "*")))))
-                        (t
-                         (shr-insert (or (string-trim alt) "*")))))))
+                                              (dom-attr dom 'srcset))))
+                            (url (and src (not (string-empty-p src))
+                                      (if (string-prefix-p "mxc://" src)
+                                          src (shr-expand-url src))))
+                            (image (cond
+                                    ((and url (string-prefix-p "mxc://" url)
+                                          session)
+                                     (leman-room--shr-image-data-sync
+                                      (leman--mxc-to-authenticated-url url session)
+                                      (leman-session-token session)))
+                                    ((and url (not shr-inhibit-images)
+                                          (not (shr-image-blocked-p url)))
+                                     (if (string-prefix-p "data:" url)
+                                         (shr-image-from-data
+                                          (substring url (length "data:")))
+                                       (leman-room--shr-image-data-sync url)))
+                                    (t nil)))
+                            (put-image (when image
+                                         (funcall shr-put-image-function
+                                                  image alt
+                                                  (list :width (shr-string-number (dom-attr dom 'width))
+                                                        :height (shr-string-number (dom-attr dom 'height)))))))
+                       (if put-image
+                           (progn
+                             ;; Cap the displayed size: shr's own
+                             ;; rescaling does not run here, because
+                             ;; the render buffer is never displayed.
+                             (setf (image-property put-image :max-width)
+                                   (round (* shr-max-image-proportion (frame-pixel-width)))
+                                   (image-property put-image :max-height)
+                                   (round (* shr-max-image-proportion (frame-pixel-height))))
+                             (when-let ((height (shr-string-number (dom-attr dom 'height))))
+                               (setf (image-property put-image :max-height) height))
+                             (when-let ((width (shr-string-number (dom-attr dom 'width))))
+                               (setf (image-property put-image :max-width) width)))
+                         (shr-insert (if (string-empty-p (string-trim alt))
+                                         "*" (string-trim alt)))))))
                   ((symbol-function 'shr-tag-blockquote)
                    (lambda (dom)
                      (let ((beg (point-marker)))
@@ -5587,7 +5597,11 @@ show it in the buffer."
                                    (get-buffer-window buffer))))
               (pcase-let ((`(,max-height . ,max-width)
                            (leman-room--image-max-sizes buffer-window)))
-                (when (fboundp 'imagemagick-types)
+                (when (and (fboundp 'imagemagick-types)
+                           ;; ImageMagick rescales every frame of an
+                           ;; animated image on each display, which is
+                           ;; very slow; use it only for static images.
+                           (not (cdr (image-multi-frame-p image))))
                   ;; Only do this when ImageMagick is supported.
                   ;; FIXME: When requiring Emacs 27+, remove this (I guess?).
                   (setf (image-property image :type) 'imagemagick))
