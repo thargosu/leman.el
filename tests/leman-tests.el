@@ -381,6 +381,21 @@ quick mouse-1 clicks to mouse-2 clicks before key lookup."
       (let ((cbeg (next-single-property-change (point-min) 'leman-spoiler-content)))
         (should-not (get-text-property cbeg 'invisible))))))
 
+(ert-deftest leman--unread-room-names-escape-percent ()
+  "Test that unread room names are escaped for the mode line.
+The indicator string is interpreted as a mode-line format string,
+so an unescaped \"%\" in a room name would be treated as a
+%-construct (invalid ones are displayed as \"*invalid*\")."
+  (let* ((room (make-leman-room :id "!room:example.com"
+                                :status 'join
+                                :display-name "100% done"
+                                :unread-notifications '((notification_count . 3)
+                                                        (highlight_count . 0))))
+         (session (make-leman-session :rooms (list room))))
+    (let ((leman-sessions (list (cons "!session:example.com" session))))
+      (should (equal (leman--unread-room-names 1)
+                     '("100%% done 3"))))))
+
 (provide 'leman-tests)
 
 ;;; leman-tests.el ends here

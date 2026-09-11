@@ -1142,6 +1142,7 @@ To be called after initial sync."
 (declare-function leman-list-rooms "leman-room-list")
 (declare-function leman-tabulated-room-list "leman-tabulated-room-list")
 (declare-function leman-directory "leman-directory")
+(declare-function leman-room--escape-% "leman-room")
 
 ;;;###autoload
 (transient-define-prefix leman-transient ()
@@ -1241,8 +1242,14 @@ Sorted by notification count, most first."
            for (room . _session) in (leman--unread-rooms)
            while (<= i max)
            collect (format "%s %s"
-                           (or (leman-room-display-name room)
-                               (leman-room-id room))
+                           ;; Escape the name: the indicator string is
+                           ;; interpreted as a mode-line format string, so
+                           ;; unescaped "%s" in a room name would be treated
+                           ;; as invalid %-constructs (displayed, e.g., as
+                           ;; "*invalid*").
+                           (leman-room--escape-%
+                            (or (leman-room-display-name room)
+                                (leman-room-id room)))
                            (map-elt (leman-room-unread-notifications room) 'notification_count 0))))
 
 (defun leman-unread-indicator-click (_event)
