@@ -427,6 +427,11 @@ Anything wrapped by HTML BLOCKQUOTE tag."
   "Redacted messages."
   :group 'leman-room-faces)
 
+(defface leman-room-spoiler
+  '((t (:inherit button)))
+  "Spoiler labels and unrevealed spoiler placeholders."
+  :group 'leman-room-faces)
+
 (defface leman-room-self-message
   '((t (:inherit (font-lock-variable-name-face))))
   "Oneself's message bodies.
@@ -4367,6 +4372,11 @@ never blocks on the network."
 (defun leman-room--render-html (string session)
   "Return rendered version of HTML STRING from SESSION.
 HTML is rendered to Emacs text using `shr-insert-document'."
+  ;; NOTE: libxml's parser drops valueless attributes, so normalize
+  ;; the valueless spoiler form (e.g. as sent by Element's /spoiler
+  ;; command) to the empty-valued form, which is preserved.
+  (setq string (replace-regexp-in-string
+                "data-mx-spoiler\\([ \t\r\n>]\\)" "data-mx-spoiler=\"\"\\1" string))
   (with-current-buffer
       (or (get-buffer " *leman-room--render-html*")
           ;; TODO: Kill this buffer when disconnecting from all sessions.
@@ -4390,7 +4400,8 @@ HTML is rendered to Emacs text using `shr-insert-document'."
             ;; them janky).  They are started in the room buffer by
             ;; `leman-room--animate-images' instead.
             (shr-image-animate nil)
-            (old-fn (symbol-function 'shr-tag-blockquote))) ;; Bind to a var to avoid unknown-function linting errors.
+            (old-fn (symbol-function 'shr-tag-blockquote)) ;; Bind to a var to avoid unknown-function linting errors.
+            (old-span-fn (symbol-function 'shr-tag-span)))
         (cl-letf (((symbol-function 'shr-fill-line) #'ignore)
                   ;; NOTE: Replace `shr-tag-img' to fetch images
                   ;; synchronously: shr's normal behavior inserts a
@@ -4450,10 +4461,83 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                                             '( wrap-prefix "    "
                                                line-prefix "    "))
                        ;; NOTE: We use our own gv, `leman-text-property'; very convenient.
-                       (add-face-text-property beg (point-max) 'leman-room-quote 'append)))))
+                       (add-face-text-property beg (point-max) 'leman-room-quote 'append))))
+                  ;; Matrix spoilers (MSC2014), e.g. as sent by
+                  ;; Element's /spoiler command.
+                  ((symbol-function 'shr-tag-span)
+                   (lambda (dom)
+                     (if-let ((reason (assq 'data-mx-spoiler (dom-attributes dom))))
+                         (let ((reason (cdr reason)))
+                           (leman-room--shr-tag-spoiler
+                            dom (and (stringp reason) (not (string-empty-p reason)) reason)))
+                       (funcall old-span-fn dom)))))
           (shr-insert-document
            (libxml-parse-html-region (point-min) (point-max))))))
     (string-trim (buffer-substring (point) (point-max)))))
+
+(defvar leman-room-spoiler-keymap
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mouse-1] #'leman-room-toggle-spoiler)
+    (define-key map (kbd "RET") #'leman-room-toggle-spoiler)
+    map)
+  "Keymap on spoiler labels and revealed spoiler content.")
+
+(defun leman-room-toggle-spoiler (event)
+  "Toggle visibility of the spoiler at point or where EVENT occurred."
+  (interactive "e")
+  (let* ((start (and (mouse-event-p event) (event-start event)))
+         (pos (if start (posn-point start) (point)))
+         (buffer (if start (window-buffer (posn-window start)) (current-buffer))))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (save-excursion
+          (goto-char pos)
+          (leman-room--toggle-spoiler-at-point))))))
+
+(defun leman-room--toggle-spoiler-at-point ()
+  "Toggle visibility of the spoiler content containing or following point."
+  (let* ((content-beg (cond ((get-text-property (point) 'leman-spoiler-content)
+                             ;; Point is in the content: its run is its extent.
+                             (or (previous-single-property-change (1+ (point)) 'leman-spoiler-content)
+                                 (point-min)))
+                            ;; Point is on the label: content follows it.
+                            (t (next-single-property-change (point) 'leman-spoiler-content))))
+         (content-end (when content-beg
+                        ;; Nil when the content extends to the end of
+                        ;; the buffer.
+                        (or (next-single-property-change content-beg 'leman-spoiler-content)
+                            (point-max)))))
+    (when (and content-beg content-end)
+      (let ((inhibit-read-only t)
+            (buffer-undo-list t))
+        (if (get-text-property content-beg 'invisible)
+            (remove-text-properties content-beg content-end '(invisible nil))
+          (add-text-properties content-beg content-end
+                               '(invisible leman-spoiler)))))))
+
+(defun leman-room--shr-tag-spoiler (dom reason)
+  "Insert DOM rendered by shr as a spoiler labeled with REASON.
+The content is hidden; clicking the label or pressing RET reveals
+it (see `leman-room-toggle-spoiler')."
+  (let ((label (if (and reason (not (string-empty-p reason)))
+                    (format "[spoiler: %s] " reason)
+                  "[spoiler] "))
+        (props (list 'leman-spoiler-content t
+                     'invisible 'leman-spoiler
+                     'keymap leman-room-spoiler-keymap
+                     'mouse-face 'highlight
+                     'follow-link t
+                     'help-echo "RET/click to reveal or hide this spoiler")))
+    (insert (propertize label
+                        'face 'leman-room-spoiler
+                        'keymap leman-room-spoiler-keymap
+                        'mouse-face 'highlight
+                        'follow-link t
+                        'help-echo "RET/click to reveal or hide this spoiler"))
+    (let ((content-beg (point))
+          (inhibit-read-only t))
+      (funcall (symbol-function 'shr-generic) dom)
+      (add-text-properties content-beg (point) props))))
 
 (defun leman-room--animate-images (beg end)
   "Start animating multi-frame images between BEG and END.
@@ -5780,13 +5864,22 @@ Then invalidate EVENT's node to show the image."
   "Return \"m.file\" EVENT formatted as a string."
   ;; TODO: Insert thumbnail images when enabled.
   (pcase-let* (((cl-struct leman-event
-                           (content (map filename
+                           (content (map body
+                                         filename
                                          ('info (map mimetype size))
                                          ('url mxc-url))))
                 event)
+               ;; The spec now prefers "filename", but older events
+               ;; only have "body".
+               (filename (or filename body))
                (human-size (when size
                              (file-size-human-readable size)))
-               (string (format "[file: %s (%s) (%s)]" filename mimetype human-size)))
+               (string (concat "[file: " filename
+                               (when mimetype
+                                 (format " (%s)" mimetype))
+                               (when human-size
+                                 (format " (%s)" human-size))
+                               "]")))
     (concat (propertize string
                         'action #'call-interactively
                         'button t
@@ -5808,8 +5901,16 @@ Then invalidate EVENT's node to show the image."
                                          ('info (map mimetype size w h))
                                          ('url mxc-url))))
                 event)
-               (human-size (file-size-human-readable size))
-               (string (format "[video: %s (%s) (%sx%s) (%s)]" body mimetype w h human-size)))
+               (human-size (when size
+                             (file-size-human-readable size)))
+               (string (concat "[video: " body
+                               (when mimetype
+                                 (format " (%s)" mimetype))
+                               (when (and w h)
+                                 (format " (%sx%s)" w h))
+                               (when human-size
+                                 (format " (%s)" human-size))
+                               "]")))
     (concat (propertize string
                         'action #'call-interactively
                         'button t
@@ -5830,9 +5931,18 @@ Then invalidate EVENT's node to show the image."
                                          ('info (map mimetype duration size))
                                          ('url mxc-url))))
                 event)
-               (human-size (file-size-human-readable size))
-               (human-duration (format-seconds "%m:%s" (/ duration 1000)))
-               (string (format "[audio: %s (%s) (%s) (%s)]" body mimetype human-duration human-size)))
+               (human-size (when size
+                             (file-size-human-readable size)))
+               (human-duration (when (> (or duration 0) 0)
+                                 (format-seconds "%m:%s" (/ duration 1000))))
+               (string (concat "[audio: " body
+                               (when mimetype
+                                 (format " (%s)" mimetype))
+                               (when human-duration
+                                 (format " (%s)" human-duration))
+                               (when human-size
+                                 (format " (%s)" human-size))
+                               "]")))
     (concat (propertize string
                         'action #'leman-room-download-file
                         'button t

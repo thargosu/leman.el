@@ -311,6 +311,51 @@ slot, so these branches never applied."
     (should (member 'leman-tabulated-room-list-left
                     (map-elt (get-text-property 0 'face left-name) :inherit)))))
 
+(ert-deftest leman-room--render-html-spoilers ()
+  "Test that Matrix spoilers are rendered and hidden.
+Both the valueless attribute form (as sent by, e.g. Element's
+/spoiler command) and the reasoned form are covered."
+  (let ((string (let ((leman-room-use-variable-pitch nil))
+                  (leman-room--render-html
+                   "Before <span data-mx-spoiler>the secret</span> mid <span data-mx-spoiler=\"plot twist\">snape did it</span>"
+                   nil))))
+    ;; Labels and content are rendered in order.
+    (should (string-match "\\[spoiler\\] the secret" string))
+    (should (string-match "\\[spoiler: plot twist\\] snape did it" string))
+    ;; Content is hidden and toggleable.
+    (let ((cbeg (next-single-property-change 0 'leman-spoiler-content string)))
+      (should cbeg)
+      (should (eq (get-text-property cbeg 'invisible string) 'leman-spoiler))
+      (should (get-text-property cbeg 'keymap string))
+      (should (equal (substring-no-properties string cbeg
+                                               (next-single-property-change cbeg 'leman-spoiler-content string))
+                     "the secret"))
+      ;; Labels are clickable too.
+      (let ((label-beg (string-match "\\[spoiler\\]" string)))
+        (should (get-text-property label-beg 'keymap string))
+        (should (get-text-property label-beg 'face string))))))
+
+(ert-deftest leman-room--toggle-spoiler-at-point ()
+  "Test that toggling reveals and hides spoiler content.
+Toggling works both from within the content and from its label."
+  (let ((string (let ((leman-room-use-variable-pitch nil))
+                  (leman-room--render-html
+                   "<span data-mx-spoiler>hidden words</span>" nil))))
+    (with-temp-buffer
+      (insert string)
+      ;; From within the content.
+      (goto-char (next-single-property-change (point-min) 'leman-spoiler-content))
+      (should (get-text-property (point) 'invisible))
+      (leman-room--toggle-spoiler-at-point)
+      (should-not (get-text-property (point) 'invisible))
+      (leman-room--toggle-spoiler-at-point)
+      (should (eq (get-text-property (point) 'invisible) 'leman-spoiler))
+      ;; From the label.
+      (goto-char (point-min))
+      (search-forward "[spoiler]")
+      (leman-room--toggle-spoiler-at-point)
+      (should-not (get-text-property (point) 'invisible)))))
+
 (provide 'leman-tests)
 
 ;;; leman-tests.el ends here

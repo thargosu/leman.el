@@ -272,7 +272,13 @@ Leman.el doesn't support encrypted rooms natively, but it can be used transparen
 
 ** 0.18-pre
 
-Nothing new yet.
+*Additions*
+
++ Support Matrix spoilers in formatted messages (as sent by, e.g. Element's ~/spoiler~ command).  Spoiled content is hidden behind a ~[spoiler]~ label (which includes the spoiler's reason, when given); clicking the label or pressing ~RET~ on it reveals or hides the content.
+
+*Fixes*
+
++ Video, audio, and file messages are formatted robustly when their metadata is incomplete (e.g. older ~m.file~ events, which have no ~filename~).
 
 ** 0.17
 
