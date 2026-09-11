@@ -317,6 +317,9 @@ Does not include filenames, emotes, etc.")
 (defvar leman-notify-limit-room-name-width)
 (defvar leman-view-room-display-buffer-action)
 
+;; Defined later in this file.
+(defvar leman-room-images)
+
 ;; Defined in Emacs 28.1: silence byte-compilation warning in earlier versions.
 (defvar browse-url-handlers)
 
@@ -347,6 +350,13 @@ Called with two arguments, the room and the session."
   "Up to this many users, show a reaction's senders' names.
 If more than this many users have sent a reaction, show the
 number of senders instead (and the names in a tooltip)."
+  :type 'natnum)
+
+(defcustom leman-room-reaction-emoji-max-size 20
+  "Maximum width/height in pixels of custom-emoji images shown as reaction keys.
+Custom emoji reactions (e.g. as sent by, e.g. Element) have
+mxc:// URIs as their keys; the images are downloaded through the
+session's authenticated media endpoint and shown at this size."
   :type 'natnum)
 
 (defcustom leman-room-hide-redacted-message-content t
@@ -2437,14 +2447,15 @@ these all require at least version 29 of Emacs):
                      do (funcall forward-fn)
                      finally return (buffer-substring-no-properties beg (point)))))
         (key-at (pos)
-          (cond ((face-at-point-p 'leman-room-reactions-key)
-                 (buffer-substring-while
-                  pos (lambda () (face-at-point-p 'leman-room-reactions-key))))
-                ((face-at-point-p 'leman-room-reactions)
-                 ;; Point is in a reaction button but after the key.
-                 (buffer-substring-while
-                  (button-start (button-at pos))
-                  (lambda () (face-at-point-p 'leman-room-reactions-key)))))))
+          (or (get-text-property pos 'leman-reaction-key)
+              (cond ((face-at-point-p 'leman-room-reactions-key)
+                     (buffer-substring-while
+                      pos (lambda () (face-at-point-p 'leman-room-reactions-key))))
+                    ((face-at-point-p 'leman-room-reactions)
+                     ;; Point is in a reaction button but after the key.
+                     (buffer-substring-while
+                      (button-start (button-at pos))
+                      (lambda () (face-at-point-p 'leman-room-reactions-key))))))))
      (list (or (key-at (point))
                (char-to-string (read-char-by-name "Reaction (prepend \"*\" for substring search): ")))
            (ewoc-data (ewoc-locate leman-ewoc))
@@ -4086,29 +4097,61 @@ Formats according to `leman-room-message-format-spec', which see."
   "Return formatted reactions to EVENT in ROOM."
   ;; TODO: Like other events, pop to a buffer showing the raw reaction events when a key is pressed.
   (cl-labels
-      ((format-reaction (ks)
-         (pcase-let* ((`(,key . ,senders) ks)
-                      (key (propertize key 'face 'leman-room-reactions-key))
-                      (count (propertize (format " (%s)"
-                                                 (if (length> senders leman-room-reaction-names-limit)
-                                                     (length senders)
-                                                   (senders-names senders room)))
-                                         'face 'leman-room-reactions))
-                      (string
-                       (propertize (concat key count)
-                                   'button '(t)
-                                   'category 'default-button
-                                   'action #'leman-room-reaction-button-action
-                                   'follow-link t
-                                   'help-echo (lambda (_window buffer _pos)
-                                                ;; NOTE: If the reaction key string is a Unicode character composed
-                                                ;; with, e.g. "VARIATION SELECTOR-16", `string-to-char' ignores the
-                                                ;; composed modifier/variation-selector and just returns the first
-                                                ;; character of the string.  This should be fine, since it's just
-                                                ;; for the tooltip.
-                                                (concat
-                                                 (get-char-code-property (string-to-char key) 'name) ": "
-                                                 (senders-names senders (buffer-local-value 'leman-room buffer))))))
+       ((reaction-image (key)
+          (when-let* ((leman-room-images)
+                      ((string-prefix-p "mxc://" key))
+                      (session leman-session)
+                      (url (leman--mxc-to-authenticated-url key session))
+                      (data (or (leman-room--shr-image-data url)
+                                ;; Not in the URL cache: fetch it in the
+                                ;; background; the event will be re-rendered
+                                ;; (showing the image) when it arrives.
+                                (progn
+                                  (leman-room--fetch-html-image
+                                   url event room (leman-session-token session))
+                                  nil))))
+            ;; NOTE: `shr-get-image-data' returns (DATA CONTENT-TYPE)
+            ;; in Emacs 30+, and just DATA (a string) in older
+            ;; versions; normalize to the data string.
+            (condition-case err
+                (create-image (if (consp data) (car data) data)
+                              nil 'data-p :ascent 'center
+                              :max-width leman-room-reaction-emoji-max-size
+                              :max-height leman-room-reaction-emoji-max-size)
+              ;; Don't let an unreadable image break message rendering.
+              (error (leman-debug "Reaction emoji image error:" err) nil))))
+       (format-reaction (ks)
+          (pcase-let* ((`(,raw-key . ,senders) ks)
+                       (key-image (reaction-image raw-key))
+                       (key (if key-image
+                                (propertize " " 'display key-image)
+                              (propertize raw-key 'face 'leman-room-reactions-key)))
+                       (count (propertize (format " (%s)"
+                                                  (if (length> senders leman-room-reaction-names-limit)
+                                                      (length senders)
+                                                    (senders-names senders room)))
+                                          'face 'leman-room-reactions))
+                       (string
+                        (propertize (concat key count)
+                                    ;; NOTE: The raw key is stored in a text property so it can be
+                                    ;; toggled when the displayed key is, e.g., an image for a
+                                    ;; custom-emoji reaction (in which case the raw key does not
+                                    ;; appear in the buffer text).
+                                    'leman-reaction-key raw-key
+                                    'button '(t)
+                                    'category 'default-button
+                                    'action #'leman-room-reaction-button-action
+                                    'follow-link t
+                                    'help-echo (lambda (_window buffer _pos)
+                                                 ;; NOTE: If the reaction key string is a Unicode character composed
+                                                 ;; with, e.g. "VARIATION SELECTOR-16", `string-to-char' ignores the
+                                                 ;; composed modifier/variation-selector and just returns the first
+                                                 ;; character of the string.  This should be fine, since it's just
+                                                 ;; for the tooltip.
+                                                 (concat
+                                                  (unless key-image
+                                                    (concat (get-char-code-property (string-to-char raw-key) 'name) ": "))
+                                                  (senders-names senders (buffer-local-value 'leman-room buffer))))))
                       (local-user-p (cl-member (leman-user-id (leman-session-user leman-session)) senders
                                                :key #'leman-user-id :test #'equal)))
            (when local-user-p

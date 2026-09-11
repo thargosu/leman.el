@@ -396,6 +396,76 @@ so an unescaped \"%\" in a room name would be treated as a
       (should (equal (leman--unread-room-names 1)
                      '("100%% done 3"))))))
 
+(defun leman-tests--reacted-event (reaction-key &optional sender-id)
+  "Return an event with a reaction of REACTION-KEY by SENDER-ID.
+The reaction is stored in the event's local reactions list, as
+`leman-room--format-reactions' expects."
+  (let ((event (make-leman-event :id "$event"))
+        (sender (make-leman-user :id (or sender-id "@other:example.com"))))
+    (setf (map-elt (leman-event-local event) 'reactions)
+          (list (make-leman-event
+                 :sender sender
+                 :content `((m.relates_to . ((rel_type . "m.annotation")
+                                             (event_id . "$event")
+                                             (key . ,reaction-key)))))))
+    event))
+
+(defun leman-tests--format-reactions ()
+  "Return formatted reactions of a reacted event with test data."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (event (leman-tests--reacted-event "👍")))
+    (leman-room--format-reactions event room)))
+
+(ert-deftest leman-room--format-reactions-store-key-property ()
+  "Test that reactions store their raw key in a text property.
+The property is used to recover the key when the button is
+pushed (necessary for custom-emoji reactions, whose keys do not
+appear in the buffer text)."
+  (let ((leman-session (make-leman-session
+                        :user (make-leman-user :id "@me:example.com"))))
+    (let ((string (leman-tests--format-reactions)))
+      (should (equal (get-text-property (string-match "👍" string) 'leman-reaction-key string)
+                     "👍")))))
+
+(ert-deftest leman-room--format-reactions-custom-emoji ()
+  "Test that custom-emoji reaction keys (mxc URIs) are handled.
+When the emoji's image is available (from the URL cache), it is
+rendered in place of the key; otherwise, the mxc URI is shown as
+the key.  In either case, the raw key is stored in a text
+property for toggling."
+  (let ((leman-session (make-leman-session
+                        :user (make-leman-user :id "@me:example.com")
+                        :server (make-leman-server :uri-prefix "https://matrix.example.com"))))
+    (let* ((event (leman-tests--reacted-event "mxc://example.com/emoji"))
+           (room (make-leman-room :id "!room:example.com"))
+           (string (leman-room--format-reactions event room)))
+      ;; Without the image, the key is shown as the mxc URI.
+      (should (string-match-p "mxc://example.com/emoji" string))
+      (should (equal (get-text-property (string-match "mxc://" string) 'leman-reaction-key string)
+                     "mxc://example.com/emoji")))
+    ;; With the image available, the key is an image, not the mxc
+    ;; URI.  Test both shapes of `shr-get-image-data' return value:
+    ;; a (DATA CONTENT-TYPE) list in Emacs 30+, and a DATA string
+    ;; in older versions.
+    (dolist (shr-data '("mock-image-data" ("mock-image-data" image/gif)))
+      (let* ((event (leman-tests--reacted-event "mxc://example.com/emoji"))
+             (room (make-leman-room :id "!room:example.com"))
+             (leman-room-images t)
+             (string (cl-letf (((symbol-function 'leman-room--shr-image-data)
+                                (lambda (_url) shr-data))
+                               ((symbol-function 'leman-room--fetch-html-image) #'ignore)
+                               ((symbol-function 'create-image)
+                                (lambda (&rest _) 'mock-image)))
+                       (leman-room--format-reactions event room))))
+        ;; With the image available, the key is an image, not the mxc URI.
+        (should-not (string-match-p "mxc://example.com/emoji" string))
+        (should (eq (get-text-property (next-single-property-change 0 'display string)
+                                       'display string)
+                    'mock-image))
+        (should (equal (get-text-property (next-single-property-change 0 'leman-reaction-key string)
+                                          'leman-reaction-key string)
+                       "mxc://example.com/emoji"))))))
+
 (provide 'leman-tests)
 
 ;;; leman-tests.el ends here
