@@ -136,6 +136,12 @@ Set automatically when `leman-room-list-mode' is activated.")
   "Automatically update the taxy-based room list buffer."
   :type 'boolean)
 
+(defcustom leman-room-list-auto-update-interval 10
+  "Minimum number of seconds between room list auto-updates.
+Rebuilding the room list is expensive with many rooms; updates
+triggered more often than this are coalesced."
+  :type 'natnum)
+
 (defcustom leman-room-list-avatars (display-images-p)
   "Show room avatars in the room list."
   :type 'boolean)
@@ -836,17 +842,42 @@ Sets `leman-room-list-visibility-cache' to the value of
       (setf leman-room-list-visibility-cache magit-section-visibility-cache))))
 
 ;;;###autoload
-(defun leman-room-list-auto-update (_session)
-  "Automatically update the Taxy room list buffer.
-+Does so when variable `leman-room-list-auto-update' is non-nil.
-+To be called in `leman-sync-callback-hook'."
-  (when (and leman-room-list-auto-update
-             (buffer-live-p (get-buffer "*Leman Room List*")))
+(defvar leman-room-list--auto-update-timer nil
+  "Pending timer for a coalesced room list auto-update.")
+
+(defvar leman-room-list--last-update-time nil
+  "Time of the last room list auto-update.")
+
+(defun leman-room-list--do-auto-update ()
+  "Revert the room list buffer, if it still exists."
+  (setf leman-room-list--auto-update-timer nil
+        leman-room-list--last-update-time (current-time))
+  (when (buffer-live-p (get-buffer "*Leman Room List*"))
     (with-current-buffer (get-buffer "*Leman Room List*")
       (unless (region-active-p)
         ;; Don't refresh the list if the region is active (e.g. if the user is trying to
         ;; operate on multiple rooms).
         (revert-buffer)))))
+
+(defun leman-room-list-auto-update (_session)
+  "Automatically update the Taxy room list buffer.
++Does so when variable `leman-room-list-auto-update' is non-nil,
++at most once every `leman-room-list-auto-update-interval'
++seconds (more frequent updates are coalesced).  To be called in
++`leman-sync-callback-hook'."
+  (when (and leman-room-list-auto-update
+             (buffer-live-p (get-buffer "*Leman Room List*")))
+    (let* ((elapsed (if leman-room-list--last-update-time
+                        (float-time (time-subtract (current-time)
+                                                   leman-room-list--last-update-time))
+                      most-positive-fixnum))
+           (delay (max 0 (- leman-room-list-auto-update-interval elapsed))))
+      (if (zerop delay)
+          (leman-room-list--do-auto-update)
+        ;; Schedule a coalesced update, if none is already pending.
+        (unless (timerp leman-room-list--auto-update-timer)
+          (setf leman-room-list--auto-update-timer
+                (run-with-timer delay nil #'leman-room-list--do-auto-update)))))))
 
 (defun leman-room-list--timestamp-colors ()
   "Return a vector of generated latest-timestamp colors for rooms.
