@@ -4321,15 +4321,17 @@ displayed."
   (declare (indent defun))
   (unless (or (gethash url leman-room--html-image-cache)
               (url-is-cached url))
-    (plz 'get url :as 'binary :queue leman-images-queue :noquery t
-      :headers (when token
-                 (list (cons "Authorization" (concat "Bearer " token))))
-      :then (lambda (data)
-              (puthash url data leman-room--html-image-cache)
-              ;; Re-render the event so the image is displayed.
-              (leman-room--invalidate-event-node event room))
-      :else (lambda (plz-error)
-              (leman-debug "HTML image fetch failed:" url plz-error)))))
+    (plz-run
+     (plz-queue leman-images-queue
+       'get url :as 'binary :noquery t
+       :headers (when token
+                  (list (cons "Authorization" (concat "Bearer " token))))
+       :then (lambda (data)
+               (puthash url data leman-room--html-image-cache)
+               ;; Re-render the event so the image is displayed.
+               (leman-room--invalidate-event-node event room))
+       :else (lambda (plz-error)
+               (leman-debug "HTML image fetch failed:" url plz-error))))))
 
 (defun leman-room--shr-image-data (url)
   "Return image spec for URL from the caches, if present.
