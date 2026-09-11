@@ -841,7 +841,6 @@ Sets `leman-room-list-visibility-cache' to the value of
     (when magit-section-visibility-cache
       (setf leman-room-list-visibility-cache magit-section-visibility-cache))))
 
-;;;###autoload
 (defvar leman-room-list--auto-update-timer nil
   "Pending timer for a coalesced room list auto-update.")
 
@@ -859,6 +858,7 @@ Sets `leman-room-list-visibility-cache' to the value of
         ;; operate on multiple rooms).
         (revert-buffer)))))
 
+;;;###autoload
 (defun leman-room-list-auto-update (_session)
   "Automatically update the Taxy room list buffer.
 +Does so when variable `leman-room-list-auto-update' is non-nil,
