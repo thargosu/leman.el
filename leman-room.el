@@ -49,6 +49,7 @@
 (require 'subr-x)
 (require 'mwheel)
 (require 'dnd)
+(require 'url-cache)
 
 (require 'leman-api)
 (require 'leman-lib)
@@ -4316,10 +4317,17 @@ If FORMATTED-P, return the formatted body content, when available."
       (setf body "[redacted]"))
     body))
 
-(defvar leman-room--html-image-cache (make-hash-table :test #'equal)
-  "Hash table mapping image URLs to fetched image data.
-Used for images in HTML message bodies, which are fetched
-asynchronously and re-rendered when they arrive.")
+(defun leman-room--store-image-in-url-cache (url data)
+  "Store image DATA in the URL cache for URL.
+The file mimics a raw HTTP response, the format that
+`shr-get-image-data' expects to find in the URL cache."
+  (let ((filename (url-cache-create-filename url)))
+    (make-directory (file-name-directory filename) t)
+    (with-temp-file filename
+      (set-buffer-multibyte nil)
+      (insert (format "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\n\r\n"
+                      (length data)))
+      (insert data))))
 
 (defun leman-room--invalidate-event-node (event room)
   "Invalidate EVENT's node in ROOM's buffer, if any.
@@ -4336,32 +4344,29 @@ its last rendering."
 (cl-defun leman-room--fetch-html-image (url event room &optional token)
   "Fetch image URL for EVENT in ROOM, asynchronously.
 TOKEN is the bearer token, for authenticated media URLs.  When
-the data arrives, it is stored in `leman-room--html-image-cache'
-and EVENT's node is invalidated, re-rendering it with the image
-displayed."
+the data arrives, it is stored in the URL cache -- where the
+renderer picks it up -- and EVENT's node is invalidated,
+re-rendering the message with the image displayed."
   (declare (indent defun))
-  (unless (or (gethash url leman-room--html-image-cache)
-              (url-is-cached url))
+  (unless (url-is-cached url)
     (plz-run
      (plz-queue leman-images-queue
        'get url :as 'binary :noquery t
        :headers (when token
                   (list (cons "Authorization" (concat "Bearer " token))))
        :then (lambda (data)
-               (puthash url data leman-room--html-image-cache)
+               (leman-room--store-image-in-url-cache url data)
                ;; Re-render the event so the image is displayed.
                (leman-room--invalidate-event-node event room))
        :else (lambda (plz-error)
                (leman-debug "HTML image fetch failed:" url plz-error))))))
 
 (defun leman-room--shr-image-data (url)
-  "Return image spec for URL from the caches, if present.
-Checks `leman-room--html-image-cache' and the URL cache.  Unlike
-shr's own image handling, this never fetches: rendering never
-blocks on the network."
-  (or (gethash url leman-room--html-image-cache)
-      (and (url-is-cached url)
-           (shr-get-image-data url))))
+  "Return image spec for URL from the URL cache, if present.
+Unlike shr's own image handling, this never fetches: rendering
+never blocks on the network."
+  (and (url-is-cached url)
+       (shr-get-image-data url)))
 
 (defun leman-room--render-html (string session)
   "Return rendered version of HTML STRING from SESSION.
@@ -4418,7 +4423,7 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                                                   image alt
                                                   (list :width (shr-string-number (dom-attr dom 'width))
                                                         :height (shr-string-number (dom-attr dom 'height)))))))
-                       (if put-image
+                       (if (imagep put-image)
                            (progn
                              ;; Cap the displayed size: shr's own
                              ;; rescaling does not run here, because
@@ -4438,8 +4443,11 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                                                     (image-animate-timer put-image))))
                                (cancel-timer timer)
                                (image-animate put-image nil leman-room-image-max-fps)))
-                         (shr-insert (if (string-empty-p (string-trim alt))
-                                         "*" (string-trim alt)))))))
+                         (when (display-graphic-p)
+                           ;; Non-graphic displays: `shr-put-image'
+                           ;; already inserted the alt text.
+                           (shr-insert (if (string-empty-p (string-trim alt))
+                                           "*" (string-trim alt))))))))
                   ((symbol-function 'shr-tag-blockquote)
                    (lambda (dom)
                      (let ((beg (point-marker)))
