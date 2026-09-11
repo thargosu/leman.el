@@ -866,7 +866,11 @@ Sets `leman-room-list-visibility-cache' to the value of
 +seconds (more frequent updates are coalesced).  To be called in
 +`leman-sync-callback-hook'."
   (when (and leman-room-list-auto-update
-             (buffer-live-p (get-buffer "*Leman Room List*")))
+             (buffer-live-p (get-buffer "*Leman Room List*"))
+             ;; Only rebuild while the list is visible; a full rebuild
+             ;; is expensive with many rooms, and buried buffers can
+             ;; be updated when shown instead.
+             (get-buffer-window "*Leman Room List*" 'all-frames))
     (let* ((elapsed (if leman-room-list--last-update-time
                         (float-time (time-subtract (current-time)
                                                    leman-room-list--last-update-time))

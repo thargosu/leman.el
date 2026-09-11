@@ -2,3 +2,5 @@
 *.elc
 /worktrees/
 /.#*
+/leman-autoloads.el
+/leman-pkg.el
