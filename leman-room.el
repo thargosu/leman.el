@@ -5540,10 +5540,14 @@ options `leman-room-image-thumbnail-height' and
   "Download image EVENT on SESSION and call THEN, else ELSE.
 If AUTHENTICATEDP, send authenticated request to new
 endpoint (Matrix 1.11, MSC3911); otherwise send old-style,
-unauthenticated request to old endpoint.""
+unauthenticated request to old endpoint.  Prefers the event's
+thumbnail, if any, for speed (the full-size image can be very
+large; use `leman-room-image-show' to view it)."
   (declare (indent defun))
   (pcase-let* (((cl-struct leman-event content) event)
-               ((map ('url mxc)) content))
+               ((map ('url mxc)) content)
+               ((map ('info (map ('thumbnail_url thumbnail-mxc)))) content)
+               (mxc (or thumbnail-mxc mxc)))
     (leman--media-request mxc session :then then :else else
       :queue leman-images-queue :authenticatedp authenticatedp)))
 
