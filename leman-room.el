@@ -300,6 +300,14 @@ which case setting this to nil shows their first frame instead."
   :type 'boolean
   :group 'leman-room-images)
 
+(defcustom leman-room-image-max-fps 10
+  "Maximum frame rate for animated images in message bodies.
+Each animated image runs its own timer, and shr starts them at
+60fps; with many images in a buffer, that can overload
+redisplay.  Lower this to reduce the load."
+  :type 'natnum
+  :group 'leman-room-images)
+
 (defvar leman-room-message-history nil
   "History list of messages entered with `leman-room' commands.
 Does not include filenames, emotes, etc.")
@@ -4416,7 +4424,14 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                              (when-let ((height (shr-string-number (dom-attr dom 'height))))
                                (setf (image-property put-image :max-height) height))
                              (when-let ((width (shr-string-number (dom-attr dom 'width))))
-                               (setf (image-property put-image :max-width) width)))
+                               (setf (image-property put-image :max-width) width))
+                             ;; Throttle animation: shr starts each
+                             ;; animated image at 60fps, and with many
+                             ;; images that overloads redisplay.
+                             (when-let ((timer (and leman-room-animate-message-images
+                                                    (image-animate-timer put-image))))
+                               (cancel-timer timer)
+                               (image-animate put-image nil leman-room-image-max-fps)))
                          (shr-insert (if (string-empty-p (string-trim alt))
                                          "*" (string-trim alt)))))))
                   ((symbol-function 'shr-tag-blockquote)
