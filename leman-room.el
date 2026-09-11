@@ -293,6 +293,13 @@ In that case, sender names are aligned to the margin edge.")
 The first group is the URL-encoded room ID, alias, or user ID;
 the second, the optional event ID.  Both may be percent-encoded.")
 
+(defcustom leman-room-animate-message-images t
+  "Animate images in message bodies, if the format supports it.
+Rooms containing many animated images can overload redisplay, in
+which case setting this to nil shows their first frame instead."
+  :type 'boolean
+  :group 'leman-room-images)
+
 (defvar leman-room-message-history nil
   "History list of messages entered with `leman-room' commands.
 Does not include filenames, emotes, etc.")
@@ -4362,6 +4369,7 @@ HTML is rendered to Emacs text using `shr-insert-document'."
       ;; resized (i.e. the wrapping is adjusted automatically by redisplay
       ;; rather than requiring the message to be re-rendered to HTML).
       (let ((shr-use-fonts leman-room-use-variable-pitch)
+            (shr-image-animate leman-room-animate-message-images)
             (old-fn (symbol-function 'shr-tag-blockquote))) ;; Bind to a var to avoid unknown-function linting errors.
         (cl-letf (((symbol-function 'shr-fill-line) #'ignore)
                   ;; NOTE: Replace `shr-tag-img' to fetch images
