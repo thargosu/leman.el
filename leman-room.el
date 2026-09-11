@@ -4242,7 +4242,18 @@ If FORMATTED-P, return the formatted body content, when available."
                        (pcase (or new-content-format content-format)
                           ("org.matrix.custom.html"
                            (save-match-data
-                             (leman-room--render-html formatted-body session)))
+                             (let ((rendered (leman-room--render-html formatted-body session)))
+                               ;; Fetch any mxc:// images in the body
+                               ;; asynchronously; the event is
+                               ;; re-rendered when they arrive.
+                               (let ((start 0))
+                                 (while (string-match "mxc://[^\"' >]+" formatted-body start)
+                                   (leman-room--fetch-html-image
+                                    (leman--mxc-to-authenticated-url (match-string 0 formatted-body) session)
+                                    event leman-room
+                                    (leman-session-token session))
+                                   (setf start (match-end 0))))
+                               rendered)))
                          (_ (format "[unknown body format: %s] %s"
                                     (or new-content-format content-format) body)))))
                (appendix (pcase msgtype
@@ -4284,29 +4295,50 @@ If FORMATTED-P, return the formatted body content, when available."
       (setf body "[redacted]"))
     body))
 
-(defun leman-room--shr-image-data-sync (url &optional token)
-  "Return image spec for URL, fetching synchronously if needed.
-When TOKEN, it is sent as a bearer token, for authenticated media
-endpoints.  Like shr's image handling, but synchronous: returns
-the cached image data when present, otherwise fetches with
-`url-retrieve-synchronously' and populates the URL cache, so
-subsequent renders use the cache."
-  (if (url-is-cached url)
-      (shr-get-image-data url)
-    (let (buffer
-          (url-request-extra-headers
-           (when token
-             (list (cons "Authorization" (concat "Bearer " token))))))
-      (unwind-protect
-          (when-let ((response (url-retrieve-synchronously url)))
-            (setf buffer response)
-            (with-current-buffer response
-              (url-store-in-cache response)
-              (goto-char (point-min))
-              (when (or (search-forward "\n\n" nil t)
-                        (search-forward "\r\n\r\n" nil t))
-                (shr-parse-image-data))))
-        (when buffer (kill-buffer buffer))))))
+(defvar leman-room--html-image-cache (make-hash-table :test #'equal)
+  "Hash table mapping image URLs to fetched image data.
+Used for images in HTML message bodies, which are fetched
+asynchronously and re-rendered when they arrive.")
+
+(defun leman-room--invalidate-event-node (event room)
+  "Invalidate EVENT's node in ROOM's buffer, if any.
+This re-renders the event, displaying any images fetched since
+its last rendering."
+  (when-let* ((buffer (map-elt (leman-room-local room) 'buffer))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (when-let ((node (leman-room--ewoc-last-matching leman-ewoc
+                         (lambda (node-data)
+                           (eq node-data event)))))
+        (ewoc-invalidate leman-ewoc node)))))
+
+(cl-defun leman-room--fetch-html-image (url event room &optional token)
+  "Fetch image URL for EVENT in ROOM, asynchronously.
+TOKEN is the bearer token, for authenticated media URLs.  When
+the data arrives, it is stored in `leman-room--html-image-cache'
+and EVENT's node is invalidated, re-rendering it with the image
+displayed."
+  (declare (indent defun))
+  (unless (or (gethash url leman-room--html-image-cache)
+              (url-is-cached url))
+    (plz 'get url :as 'binary :queue leman-images-queue :noquery t
+      :headers (when token
+                 (list (cons "Authorization" (concat "Bearer " token))))
+      :then (lambda (data)
+              (puthash url data leman-room--html-image-cache)
+              ;; Re-render the event so the image is displayed.
+              (leman-room--invalidate-event-node event room))
+      :else (lambda (plz-error)
+              (leman-debug "HTML image fetch failed:" url plz-error)))))
+
+(defun leman-room--shr-image-data (url)
+  "Return image spec for URL from the caches, if present.
+Checks `leman-room--html-image-cache' and the URL cache.  Unlike
+shr's own image handling, this never fetches: rendering never
+blocks on the network."
+  (or (gethash url leman-room--html-image-cache)
+      (and (url-is-cached url)
+           (shr-get-image-data url))))
 
 (defun leman-room--render-html (string session)
   "Return rendered version of HTML STRING from SESSION.
@@ -4348,15 +4380,14 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                             (image (cond
                                     ((and url (string-prefix-p "mxc://" url)
                                           session)
-                                     (leman-room--shr-image-data-sync
-                                      (leman--mxc-to-authenticated-url url session)
-                                      (leman-session-token session)))
+                                     (leman-room--shr-image-data
+                                      (leman--mxc-to-authenticated-url url session)))
                                     ((and url (not shr-inhibit-images)
                                           (not (shr-image-blocked-p url)))
                                      (if (string-prefix-p "data:" url)
                                          (shr-image-from-data
                                           (substring url (length "data:")))
-                                       (leman-room--shr-image-data-sync url)))
+                                       (leman-room--shr-image-data url)))
                                     (t nil)))
                             (put-image (when image
                                          (funcall shr-put-image-function
