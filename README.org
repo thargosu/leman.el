@@ -275,6 +275,7 @@ Leman.el doesn't support encrypted rooms natively, but it can be used transparen
 *Additions*
 
 + Support Matrix spoilers in formatted messages (as sent by, e.g. Element's ~/spoiler~ command).  Spoiled content is hidden behind a ~[spoiler]~ label (which includes the spoiler's reason, when given); clicking the label or pressing ~RET~ on it reveals or hides the content.
++ Support Matrix threads (MSC3440).  Thread replies are not shown in the main timeline; thread roots show a summary chip (~🧵 N~ followed by the latest reply) which opens a thread view buffer (also with ~s t~ with point on the root or a reply).  In the thread view, ~RET~ replies to the thread, ~g~ refreshes it from the server, and ~q~ quits.  Thread summaries are shown with the new ~%T~ message format specifier (included in the default formats).
 
 *Fixes*
 

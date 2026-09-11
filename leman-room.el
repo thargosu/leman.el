@@ -126,6 +126,7 @@ Used to, e.g. call `leman-room-compose-org'.")
 (declare-function leman-notify-switch-to-mentions-buffer "leman-notify")
 (declare-function leman-notify-switch-to-notifications-buffer "leman-notify")
 (declare-function leman--update-unread-indicator "leman.el")
+(declare-function leman--make-event "leman.el")
 
 (defvar leman-room-mode-self-insert-keymap (make-sparse-keymap)
   "The `leman-room-mode' keymap under `leman-room-self-insert-mode'.
@@ -194,6 +195,7 @@ keymap directly the issue may be visible.")
     (define-key map (kbd "<insert>") #'leman-room-dispatch-edit-message)
     (define-key map (kbd "C-k") #'leman-room-delete-message)
     (define-key map (kbd "s r") #'leman-room-send-reaction)
+    (define-key map (kbd "s t") #'leman-room-view-thread)
     (define-key map (kbd "s e") #'leman-room-send-emote)
     (define-key map (kbd "s f") #'leman-room-send-file)
     (define-key map (kbd "s i") #'leman-room-send-image)
@@ -319,6 +321,7 @@ Does not include filenames, emotes, etc.")
 
 ;; Defined later in this file.
 (defvar leman-room-images)
+(defvar leman-thread-root-id)
 
 ;; Defined in Emacs 28.1: silence byte-compilation warning in earlier versions.
 (defvar browse-url-handlers)
@@ -870,19 +873,19 @@ non-nil, set the variables buffer-locally (i.e. when called from
       (set-default option value))
     (pcase value
       ;; Try to set the margin widths smartly.
-      ("%B%r%R%t" ;; "Elemental"
-       (set-vars leman-room-left-margin-width 0
-                 leman-room-right-margin-width 8
-                 leman-room-sender-headers t
-                 leman-room-sender-in-headers t
-                 leman-room-sender-in-left-margin nil))
-      ("%S%L%B%r%R%t" ;; "IRC-style using margins"
-       (set-vars leman-room-left-margin-width 12
-                 leman-room-right-margin-width 8
-                 leman-room-sender-headers nil
-                 leman-room-sender-in-headers nil
-                 leman-room-sender-in-left-margin t))
-      ("[%t] %S> %B%r" ;; "IRC-style without margins"
+      ("%B%r%T%R%t" ;; "Elemental"
+        (set-vars leman-room-left-margin-width 0
+                  leman-room-right-margin-width 8
+                  leman-room-sender-headers t
+                  leman-room-sender-in-headers t
+                  leman-room-sender-in-left-margin nil))
+      ("%S%L%B%r%T%R%t" ;; "IRC-style using margins"
+        (set-vars leman-room-left-margin-width 12
+                  leman-room-right-margin-width 8
+                  leman-room-sender-headers nil
+                  leman-room-sender-in-headers nil
+                  leman-room-sender-in-left-margin t))
+      ("[%t] %S> %B%r%T" ;; "IRC-style without margins"
        (set-vars leman-room-left-margin-width 0
                  leman-room-right-margin-width 0
                  leman-room-sender-headers nil
@@ -923,7 +926,7 @@ non-nil, set the variables buffer-locally (i.e. when called from
         ;; is required to avoid compilation warnings).
         (message "Leman: Kill and reopen room buffers to display in new format")))))
 
-(defcustom leman-room-message-format-spec "%S%L%B%r%R%t"
+(defcustom leman-room-message-format-spec "%S%L%B%r%T%R%t"
   "Format messages according to this spec.
 It may contain these specifiers:
 
@@ -940,15 +943,16 @@ It may contain these specifiers:
   %S  Sender display name
   %t  Event timestamp, formatted according to
       `leman-room-timestamp-format'
+  %T  Thread summary (a chip linking to the thread view)
 
 Note that margin sizes must be set manually with
 `leman-room-left-margin-width' and
 `leman-room-right-margin-width'."
-  :type '(choice (const :tag "IRC-style using margins" "%S%L%B%r%R%t")
-                 (const :tag "IRC-style without margins" "[%t] %S> %B%r")
-                 (const :tag "IRC-style without margins, with wrap-prefix" "[%t] %S> %W%B%r")
-                 (const :tag "IRC-style with right margin, with wrap-prefix" "%S> %W%B%r%R%t")
-                 (const :tag "Elemental" "%B%r%R%t")
+  :type '(choice (const :tag "IRC-style using margins" "%S%L%B%r%T%R%t")
+                 (const :tag "IRC-style without margins" "[%t] %S> %B%r%T")
+                 (const :tag "IRC-style without margins, with wrap-prefix" "[%t] %S> %W%B%r%T")
+                 (const :tag "IRC-style with right margin, with wrap-prefix" "%S> %W%B%r%T%R%t")
+                 (const :tag "Elemental" "%B%r%T%R%t")
                  (string :tag "Custom format"))
   :set #'leman-room-message-format-spec-setter
   :set-after '(leman-room-left-margin-width leman-room-right-margin-width
@@ -1412,6 +1416,11 @@ spec) without requiring all events to use the same margin width."
   "Reactions."
   (ignore session)
   (leman-room--format-reactions event room))
+
+(leman-room-define-event-formatter ?T
+  "Thread summary."
+  (ignore session)
+  (leman-room--format-thread-chip event room))
 
 (leman-room-define-event-formatter ?t
   "Timestamp."
@@ -3171,10 +3180,13 @@ function to `leman-room-event-fns', which see."
                                  (lambda (data)
                                    (and (leman-event-p data)
                                         (equal related-id (leman-event-id data)))))))
-               (ewoc-invalidate leman-ewoc nodes)))
-         ;; No known related event: discard.
-         ;; TODO: Is this the correct thing to do?
-         (leman-debug "No known related event for" event))))))
+               (ewoc-invalidate leman-ewoc nodes))))
+         ;; No known related event in the timeline: maybe it's a thread
+         ;; reply (thread replies are not shown in the timeline).
+         (if-let ((thread-event (leman-room--thread-event-for-id related-id leman-room)))
+             (cl-pushnew event (map-elt (leman-event-local thread-event) 'reactions)
+                         :key #'leman-event-id :test #'equal)
+           (leman-debug "No known related event for" event))))))
 
 (leman-room-defevent "m.room.power_levels"
   (leman-room--insert-event event))
@@ -3326,18 +3338,29 @@ function to `leman-room-event-fns', which see."
   (pcase-let* (((cl-struct leman-event content unsigned) event)
                ((map ('m.relates_to (map ('rel_type rel-type) ('event_id replaces-event-id)))) content)
                ((map ('m.relations (map ('m.replace (map ('event_id replaced-by-id)))))) unsigned))
-    (if (and leman-room-replace-edited-messages
-             replaces-event-id (equal "m.replace" rel-type))
-        ;; Event replaces existing event: find and replace it in buffer if possible, otherwise insert it.
-        (or (leman-room--replace-event event)
-            (progn
-              (leman-debug "Unable to replace event ID: inserting instead." replaces-event-id)
-              (leman-room--insert-event event)))
-      ;; New event.
-      (if replaced-by-id
-          (leman-debug "Event replaced: not inserting." replaced-by-id)
-        ;; Not replaced: insert it.
-        (leman-room--insert-event event)))))
+    (cond ((and (equal "m.replace" rel-type) (leman-room--replace-thread-event event leman-room))
+           ;; Event edits a thread reply: applied to the thread data; the reply is not shown in the main timeline.
+           nil)
+          ((equal "m.thread" rel-type)
+           ;; Thread reply: aggregate into the thread's data; replies are not shown in the main timeline.
+           (pcase-let* ((root-id (leman-room--add-thread-event event leman-room)))
+             (when-let ((nodes (leman-room--ewoc-last-matching leman-ewoc
+                                 (lambda (data)
+                                   (and (leman-event-p data)
+                                        (equal root-id (leman-event-id data)))))))
+               (ewoc-invalidate leman-ewoc nodes))))
+          ((and leman-room-replace-edited-messages
+                replaces-event-id (equal "m.replace" rel-type))
+           ;; Event replaces existing event: find and replace it in buffer if possible, otherwise insert it.
+           (or (leman-room--replace-event event)
+               (progn
+                 (leman-debug "Unable to replace event ID: inserting instead." replaces-event-id)
+                 (leman-room--insert-event event))))
+          ;; New event.
+          (replaced-by-id
+           (leman-debug "Event replaced: not inserting." replaced-by-id))
+          ;; Not replaced: insert it.
+          (t (leman-room--insert-event event)))))
 
 (leman-room-defevent "m.room.tombstone"
   (pcase-let* (((cl-struct leman-event content) event)
@@ -4164,15 +4187,262 @@ Formats according to `leman-room-message-format-spec', which see."
                   collect (leman--user-displayname-in room sender)
                   into names
                   finally return (string-join names ", "))))
-    (if-let ((reactions (map-elt (leman-event-local event) 'reactions)))
-        (cl-loop with keys-senders
-                 for reaction in reactions
-                 for key = (map-nested-elt (leman-event-content reaction) '(m.relates_to key))
-                 for sender = (leman-event-sender reaction)
-                 do (push sender (alist-get key keys-senders nil nil #'string=))
-                 finally do (setf keys-senders (cl-sort keys-senders #'> :key (lambda (pair) (length (cdr pair)))))
-                 finally return (concat "\n  " (mapconcat #'format-reaction keys-senders "  ")))
+     (if-let ((reactions (map-elt (leman-event-local event) 'reactions)))
+         (cl-loop with keys-senders
+                  for reaction in reactions
+                  for key = (map-nested-elt (leman-event-content reaction) '(m.relates_to key))
+                  for sender = (leman-event-sender reaction)
+                  do (push sender (alist-get key keys-senders nil nil #'string=))
+                  finally do (setf keys-senders (cl-sort keys-senders #'> :key (lambda (pair) (length (cdr pair)))))
+                  finally return (concat "\n  " (mapconcat #'format-reaction keys-senders "  ")))
+       "")))
+
+;;;; Threads
+
+;; Threads (MSC3440): replies relating to a thread root with a
+;; "m.thread" relationship.  Thread replies are not shown in the main
+;; timeline; the root shows a summary chip which opens a thread view
+;; buffer (see `leman-room-view-thread').
+
+(defun leman-room--threads-table (room)
+  "Return ROOM's table of thread events, keyed by root event ID.
+The table is created if necessary."
+  (or (map-elt (leman-room-local room) 'threads)
+      (let ((table (make-hash-table :test #'equal)))
+        (setf (map-elt (leman-room-local room) 'threads) table)
+        table)))
+
+(defun leman-room--thread-events (room root-id)
+  "Return known thread events for root ROOT-ID in ROOM."
+  (gethash root-id (leman-room--threads-table room)))
+
+(defun leman-room--add-thread-event (event room)
+  "Store thread-reply EVENT in ROOM's thread data.
+EVENT is a reply relating to a thread root with an \"m.thread\"
+relationship.  Returns the root's event ID."
+  (pcase-let* (((cl-struct leman-event content) event)
+               ((map ('m.relates_to (map ('event_id root-id)))) content))
+    (cl-pushnew event (gethash root-id (leman-room--threads-table room))
+                :key #'leman-event-id :test #'equal)
+    root-id))
+
+(defun leman-room--thread-event-for-id (event-id room)
+  "Return the thread event with ID in ROOM, if known."
+  (cl-loop for events being the hash-values of (leman-room--threads-table room)
+           thereis (cl-find event-id events :key #'leman-event-id :test #'equal)))
+
+(defun leman-room--replace-thread-event (event room)
+  "Replace the thread event in ROOM that EVENT edits.
+Returns non-nil if the replaced event was found in a thread.
+NOTE: The original event is replaced by a copy whose content is
+merged with the edit's \"m.new_content\", so the event keeps its
+original ID and relationships."
+  (pcase-let* (((cl-struct leman-event content) event)
+               ((map ('m.relates_to (map ('event_id replaced-id)))) content)
+               (table (leman-room--threads-table room))
+               (new-content (map-elt content 'm.new_content)))
+    (cl-loop for events being the hash-values of table
+             for pos = (cl-position replaced-id events :key #'leman-event-id :test #'equal)
+             when (and pos new-content)
+             do (let ((copy (copy-leman-event (nth pos events))))
+                  ;; NOTE: New keys are prepended so they take
+                  ;; precedence in `alist-get' lookups.
+                  (setf (leman-event-content copy)
+                        (append new-content (leman-event-content copy))
+                        (nth pos events) copy))
+             and return t)))
+
+(defun leman-room--thread-summary (event)
+  "Return EVENT's server-side thread summary, if any.
+This is the \"m.thread\" aggregation in EVENT's unsigned data."
+  (map-nested-elt (leman-event-unsigned event) '(m.relations m.thread)))
+
+(defun leman-room--format-thread-chip (event room)
+  "Return a summary chip for the thread rooted at EVENT in ROOM.
+If EVENT is not a thread root with known replies, return an empty
+string."
+  (let* ((root-id (leman-event-id event))
+         (local-events (leman-room--thread-events room root-id))
+         ;; NOTE: The server-side summary may know about replies we
+         ;; haven't seen; the local events may include ones the
+         ;; summary doesn't (e.g. while the server aggregates).
+         (summary (leman-room--thread-summary event))
+         (count (max (length local-events)
+                     (or (alist-get 'count summary) 0))))
+    (if (> count 0)
+        (let* ((latest-event (or (car (cl-sort (copy-sequence local-events) #'> :key #'leman-event-origin-server-ts))
+                                 (alist-get 'latest_event summary)))
+               (snippet (when latest-event
+                          (truncate-string-to-width
+                           (or (map-elt (leman-event-content latest-event) 'body) "")
+                           40 nil nil "…")))
+               (label (format "\U0001f9f5 %d" count)))
+          (concat
+           (leman--button-buttonize
+            (propertize label 'face 'leman-room-reactions)
+            (lambda (_button) (leman-room-view-thread)))
+           (when snippet
+             (propertize " " 'display (propertize snippet 'face 'leman-room-reactions)))))
       "")))
+
+(defun leman-room-view-thread (&optional position)
+  "View the thread at POSITION in the current room buffer.
+The thread root is the event at POSITION, or the event that a
+thread reply at POSITION relates to."
+  (interactive "d")
+  (pcase-let* ((event (ewoc-data (ewoc-locate leman-ewoc (or position (point))))))
+    (unless (leman-event-p event)
+      (user-error "No event at point"))
+    (pcase-let* (((cl-struct leman-event content) event)
+                 ((map ('m.relates_to (map ('rel_type rel-type) ('event_id related-id)))) content)
+                 (root-id (if (equal rel-type "m.thread") related-id (leman-event-id event))))
+      (leman-room--view-thread root-id))))
+
+(cl-defun leman-room--view-thread (root-id)
+  "Open a buffer showing the thread rooted at ROOT-ID.
+The thread's known events are shown; the full thread is fetched
+from the server and the buffer re-rendered when it arrives."
+  (let* ((room leman-room)
+         (session leman-session)
+         (root-event (or (gethash root-id (leman-session-events session))
+                         (make-leman-event :id root-id)))
+         (buffer (get-buffer-create
+                  (format "*Leman Thread: %s*"
+                          (or (leman-room-display-name room)
+                              (leman-room-id room))))))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'leman-thread-mode)
+        (leman-thread-mode))
+      (setf leman-thread-root-id root-id
+            leman-room room
+            leman-session session)
+      (leman-room--render-thread buffer root-event))
+    (pop-to-buffer buffer)
+    ;; Fetch the full thread from the server.
+    (leman-api session
+        (format "rooms/%s/relations/%s"
+                (url-hexify-string (leman-room-id room))
+                (url-hexify-string root-id))
+      :version "v1"
+      :params '(("dir" . "f") ("limit" . "200"))
+      :then (lambda (data)
+              (when-let ((buffer-live buffer))
+                (with-current-buffer buffer
+                  (cl-loop for raw-event across (alist-get 'chunk data)
+                           for event = (leman--make-event raw-event)
+                           do (leman-room--process-fetched-thread-event event room))
+                  (leman-room--render-thread buffer root-event)))))))
+
+(defun leman-room--process-fetched-thread-event (event room)
+  "Add fetched thread EVENT to ROOM's thread data."
+  (pcase-let* (((cl-struct leman-event content) event)
+               ((map ('m.relates_to (map ('rel_type rel-type)))) content))
+    (pcase rel-type
+      ("m.thread" (leman-room--add-thread-event event room))
+      ("m.replace" (leman-room--replace-thread-event event room)))))
+
+(defun leman-room--render-thread (buffer root-event)
+  "Render in BUFFER the thread rooted at ROOT-EVENT."
+  (with-current-buffer buffer
+    (let ((inhibit-read-only t)
+          (events (leman-room--thread-events leman-room (leman-event-id root-event))))
+      (erase-buffer)
+      (insert (propertize "Thread:\n" 'face 'leman-room-name))
+      ;; Root event.
+      (leman-room--insert-thread-event root-event)
+      ;; Replies, oldest first.
+      (dolist (event (cl-sort (copy-sequence events) #'< :key #'leman-event-origin-server-ts))
+        (leman-room--insert-thread-event event))
+      (goto-char (point-max))
+      (insert (propertize (format "\n%s" (concat (propertize "RET" 'face 'help-key-binding)
+                                                 " Reply in thread  "
+                                                 (propertize "g" 'face 'help-key-binding)
+                                                 " Refresh  "
+                                                 (propertize "q" 'face 'help-key-binding)
+                                                 " Quit"))
+                          'face 'leman-room-timestamp)))))
+
+(defun leman-room--insert-thread-event (event)
+  "Insert EVENT into the current thread buffer."
+  (pcase-let* ((room leman-room)
+               (sender (leman--user-displayname-in room (leman-event-sender event)))
+               (ts (format-time-string leman-room-timestamp-format
+                                       (/ (leman-event-origin-server-ts event) 1000)))
+               (body (or (leman-room--format-message-body event leman-session)
+                         "")))
+    (insert "\n"
+            (propertize (format "%s  %s\n" sender ts)
+                        'face 'leman-room-user)
+            body "\n")
+    (when-let ((reactions (leman-room--format-reactions event room)))
+      (unless (string-empty-p reactions)
+        (insert reactions)))))
+
+(defvar leman-thread-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'leman-room-reply-in-thread)
+    (define-key map (kbd "S-<return>") #'leman-room-reply-in-thread)
+    (define-key map (kbd "r") #'leman-room-reply-in-thread)
+    (define-key map (kbd "g") #'leman-room-refresh-thread)
+    (define-key map (kbd "q") #'quit-window)
+    map)
+  "Keymap for Leman thread buffers.")
+
+(defvar-local leman-thread-root-id nil
+  "Event ID of the thread root shown in the current thread buffer.")
+
+(define-derived-mode leman-thread-mode special-mode "Leman-Thread"
+  "Major mode for buffers showing a Leman thread.")
+
+(defun leman-room-refresh-thread ()
+  "Refresh the current thread buffer."
+  (interactive)
+  (when-let* ((root-id leman-thread-root-id)
+              (root-event (gethash root-id (leman-session-events leman-session))))
+    (let ((buffer (current-buffer)))
+      (leman-api leman-session
+          (format "rooms/%s/relations/%s"
+                  (url-hexify-string (leman-room-id leman-room))
+                  (url-hexify-string root-id))
+        :version "v1"
+        :params '(("dir" . "f") ("limit" . "200"))
+        :then (lambda (data)
+                (when (buffer-live-p buffer)
+                  (with-current-buffer buffer
+                    (cl-loop for raw-event across (alist-get 'chunk data)
+                             for event = (leman--make-event raw-event)
+                             do (leman-room--process-fetched-thread-event event leman-room))
+                    (leman-room--render-thread buffer root-event))))))))
+
+(defun leman-room-reply-in-thread ()
+  "Reply in the thread shown in the current buffer."
+  (interactive)
+  (unless (derived-mode-p 'leman-thread-mode)
+    (user-error "Not in a Leman thread buffer"))
+  (when-let* ((root-id leman-thread-root-id)
+              (text (read-string "Reply in thread: ")))
+    (unless (string-empty-p text)
+      (let* ((room leman-room)
+             (session leman-session)
+             ;; Latest known event in the thread: used as the
+             ;; in-reply-to fallback target for unthreaded clients.
+             (latest-event (car (cl-sort (copy-sequence
+                                          (leman-room--thread-events room root-id))
+                                         #'> :key #'leman-event-origin-server-ts)))
+             (latest-id (or (and latest-event (leman-event-id latest-event))
+                            (when-let* ((summary (leman-room--thread-summary
+                                                 (gethash root-id (leman-session-events session)))))
+                              (map-nested-elt summary '(latest_event event_id)))
+                            root-id)))
+        (leman-send-message room session
+          :body text
+          :filter (lambda (content _room)
+                    (setf (alist-get "m.relates_to" content nil nil #'string=)
+                          (leman-alist "rel_type" "m.thread"
+                                       "event_id" root-id
+                                       "m.in_reply_to" (leman-alist "event_id" latest-id)
+                                       "is_falling_back" t))
+                    content))))))
 
 (defun leman-room--propertize-margins ()
   "Propertize margin text in current buffer."

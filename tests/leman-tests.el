@@ -410,6 +410,16 @@ The reaction is stored in the event's local reactions list, as
                                              (key . ,reaction-key)))))))
     event))
 
+(defun leman-tests--thread-reply-event (id root-id &optional ts)
+  "Return a thread reply event with ID relating to ROOT-ID."
+  (make-leman-event :id id
+                    :origin-server-ts (or ts 1000)
+                    :sender (make-leman-user :id "@other:example.com")
+                    :content `((msgtype . "m.text")
+                               (body . ,(format "reply %s" id))
+                               (m.relates_to . ((rel_type . "m.thread")
+                                                (event_id . ,root-id))))))
+
 (defun leman-tests--format-reactions ()
   "Return formatted reactions of a reacted event with test data."
   (let* ((room (make-leman-room :id "!room:example.com"))
@@ -465,6 +475,66 @@ property for toggling."
         (should (equal (get-text-property (next-single-property-change 0 'leman-reaction-key string)
                                           'leman-reaction-key string)
                        "mxc://example.com/emoji"))))))
+
+(defun leman-tests--thread-reply-event (id root-id &optional ts)
+  "Return a thread reply event with ID relating to ROOT-ID."
+  (make-leman-event :id id
+                    :origin-server-ts (or ts 1000)
+                    :sender (make-leman-user :id "@other:example.com")
+                    :content `((msgtype . "m.text")
+                               (body . ,(format "reply %s" id))
+                               (m.relates_to . ((rel_type . "m.thread")
+                                                (event_id . ,root-id))))))
+
+(ert-deftest leman-room--thread-data ()
+  "Test storing, deduplicating, and replacing thread events."
+  (let ((room (make-leman-room :id "!room:example.com"))
+        (root-id "$root"))
+    ;; Replies are stored and deduplicated.
+    (leman-room--add-thread-event (leman-tests--thread-reply-event "$reply1" root-id) room)
+    (leman-room--add-thread-event (leman-tests--thread-reply-event "$reply1" root-id) room)
+    (leman-room--add-thread-event (leman-tests--thread-reply-event "$reply2" root-id 2000) room)
+    (should (= 2 (length (leman-room--thread-events room root-id))))
+    (should-not (leman-room--thread-events room "$other-root"))
+    ;; Lookup by event ID works.
+    (should (equal "$reply2"
+                   (leman-event-id (leman-room--thread-event-for-id "$reply2" room))))
+    ;; Edits replace the stored event.
+    (let ((edit (make-leman-event :id "$edit"
+                                  :content `((m.new_content . ((body . "edited")))
+                                             (m.relates_to . ((rel_type . "m.replace")
+                                                              (event_id . "$reply1")))))))
+      (should (leman-room--replace-thread-event edit room))
+      ;; The replaced event keeps its original ID; its body is the
+      ;; edit's "m.new_content".
+      (should (equal "edited"
+                     (map-elt (leman-event-content (leman-room--thread-event-for-id "$reply1" room))
+                              'body)))
+      ;; An edit of a non-thread event does nothing.
+      (should-not (leman-room--replace-thread-event
+                   (make-leman-event :id "$edit2"
+                                     :content '((m.relates_to . ((rel_type . "m.replace")
+                                                                 (event_id . "$not-in-thread")))))
+                   room)))))
+
+(ert-deftest leman-room--format-thread-chip ()
+  "Test that thread roots show a summary chip linking to the view."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (root (make-leman-event :id "$root"))
+         (chip (progn
+                 (leman-room--add-thread-event (leman-tests--thread-reply-event "$reply1" "$root") room)
+                 (leman-room--add-thread-event (leman-tests--thread-reply-event "$reply2" "$root") room)
+                 (leman-room--format-thread-chip root room))))
+    (should (string-match-p "🧵 2" chip))
+    ;; No replies: no chip.
+    (should (string-empty-p (leman-room--format-thread-chip
+                             (make-leman-event :id "$non-root") room))))
+  ;; Server-side summary is used when local events are unknown.
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (root (make-leman-event :id "$root2"
+                                 :unsigned '((m.relations . ((m.thread . ((count . 5))))))))
+         (chip (leman-room--format-thread-chip root room)))
+    (should (string-match-p "🧵 5" chip))))
 
 (provide 'leman-tests)
 
