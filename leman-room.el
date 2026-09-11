@@ -4255,32 +4255,19 @@ If FORMATTED-P, return the formatted body content, when available."
       (setf body "[redacted]"))
     body))
 
-(defun leman-room--rewrite-mxc-imgs (dom session)
-  "Rewrite mxc:// SRC attributes in parsed HTML DOM to media URLs.
-URLs are built with `leman--mxc-to-url' for SESSION so that shr
-can download and display the images (e.g. custom emoji inserted
-by bridges).  Returns DOM."
-  (pcase dom
-    (`(,_ ,attrs . ,children)
-     (when-let ((src (and (consp attrs)
-                          (alist-get 'src attrs))))
-       (when (string-prefix-p "mxc://" src)
-         (setcdr (assq 'src attrs)
-                 (leman--mxc-to-url src session))))
-     (dolist (child children)
-       (when (consp child)
-         (leman-room--rewrite-mxc-imgs child session)))))
-  dom)
-
-(defun leman-room--shr-image-data-sync (url)
+(defun leman-room--shr-image-data-sync (url &optional token)
   "Return image spec for URL, fetching synchronously if needed.
-Like shr's image handling, but synchronous: returns the cached
-image data when present, otherwise fetches with
+When TOKEN, it is sent as a bearer token, for authenticated media
+endpoints.  Like shr's image handling, but synchronous: returns
+the cached image data when present, otherwise fetches with
 `url-retrieve-synchronously' and populates the URL cache, so
 subsequent renders use the cache."
   (if (url-is-cached url)
       (shr-get-image-data url)
-    (let (buffer)
+    (let (buffer
+          (url-request-extra-headers
+           (when token
+             (list (cons "Authorization" (concat "Bearer " token))))))
       (unwind-protect
           (when-let ((response (url-retrieve-synchronously url)))
             (setf buffer response)
@@ -4318,26 +4305,40 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                   ;; synchronously: shr's normal behavior inserts a
                   ;; placeholder and downloads asynchronously, but the
                   ;; render result is copied into the room buffer
-                  ;; before that could ever complete.
+                  ;; before that could ever complete.  Also, images
+                  ;; with mxc:// sources are downloaded through the
+                  ;; session's authenticated media endpoint.
                   ((symbol-function 'shr-tag-img)
                    (lambda (dom &optional _url)
                      (let* ((alt (or (dom-attr dom 'alt) ""))
-                            (url (and dom (or (dom-attr dom 'src)
+                            (src (and dom (or (dom-attr dom 'src)
                                               (dom-attr dom 'srcset)))))
-                       (if-let* (((not shr-inhibit-images))
-                                 (url (and url (not (string-empty-p url))
-                                           (shr-expand-url url)))
-                                 (image (cond ((string-prefix-p "data:" url)
-                                               (shr-image-from-data
-                                                (substring url (length "data:"))))
-                                              ((not (shr-image-blocked-p url))
-                                               (leman-room--shr-image-data-sync url)))))
-                           (funcall shr-put-image-function
-                                    image alt
-                                    (list :width (shr-string-number (dom-attr dom 'width))
-                                          :height (shr-string-number (dom-attr dom 'height))))
-                         (shr-insert (if (string-empty-p (string-trim alt))
-                                         "*" (string-trim alt)))))))
+                       (cond
+                        ((and src (string-prefix-p "mxc://" src) session)
+                         (let ((image (leman-room--shr-image-data-sync
+                                       (leman--mxc-to-authenticated-url src session)
+                                       (leman-session-token session))))
+                           (if image
+                               (funcall shr-put-image-function
+                                        image alt
+                                        (list :width (shr-string-number (dom-attr dom 'width))
+                                              :height (shr-string-number (dom-attr dom 'height))))
+                             (shr-insert (or (string-trim alt) "*")))))
+                        ((and src (not (string-empty-p src))
+                              (not shr-inhibit-images)
+                              (not (shr-image-blocked-p (shr-expand-url src))))
+                         (let* ((url (shr-expand-url src))
+                                (image (if (string-prefix-p "data:" url)
+                                           (shr-image-from-data (substring url (length "data:")))
+                                         (leman-room--shr-image-data-sync url))))
+                           (if image
+                               (funcall shr-put-image-function
+                                        image alt
+                                        (list :width (shr-string-number (dom-attr dom 'width))
+                                              :height (shr-string-number (dom-attr dom 'height))))
+                             (shr-insert (or (string-trim alt) "*")))))
+                        (t
+                         (shr-insert (or (string-trim alt) "*")))))))
                   ((symbol-function 'shr-tag-blockquote)
                    (lambda (dom)
                      (let ((beg (point-marker)))
@@ -4348,8 +4349,7 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                        ;; NOTE: We use our own gv, `leman-text-property'; very convenient.
                        (add-face-text-property beg (point-max) 'leman-room-quote 'append)))))
           (shr-insert-document
-           (leman-room--rewrite-mxc-imgs
-            (libxml-parse-html-region (point-min) (point-max)) session)))))
+           (libxml-parse-html-region (point-min) (point-max))))))
     (string-trim (buffer-substring (point) (point-max)))))
 
 (cl-defun leman-room--event-mentions-user-p (event user &optional (room leman-room))

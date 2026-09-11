@@ -1462,6 +1462,16 @@ Returns string suitable for the ENDPOINT argument to `leman-api'."
         (media-id (match-string 2 uri)))
     (format "media/download/%s/%s" server-name media-id)))
 
+(defun leman--mxc-to-authenticated-url (uri session)
+  "Return authenticated media download URL for MXC URI on SESSION.
+Servers implementing Matrix v1.11 authenticated media (like
+Conduit) reject the unauthenticated URLs returned by
+`leman--mxc-to-url'; this URL requires the session's token (sent
+as the Authorization header)."
+  (pcase-let* (((cl-struct leman-session server) session)
+               ((cl-struct leman-server uri-prefix) server))
+    (format "%s/_matrix/client/v1/%s" uri-prefix (leman--mxc-to-endpoint uri))))
+
 (defun leman--remove-face-property (string value)
   "Remove VALUE from STRING's `face' properties.
 Used to remove the `button' face from buttons, because that face

@@ -992,7 +992,11 @@ and `session' to the session.  Adds function to
     (if-let ((url (alist-get 'url (leman-event-content event))))
         (plz-run
          (plz-queue leman-images-queue
-           'get (leman--mxc-to-url url session) :as 'binary :noquery t
+           ;; NOTE: Authenticated media endpoint: servers like Conduit
+           ;; reject the unauthenticated download URL.
+           'get (leman--mxc-to-authenticated-url url session) :as 'binary :noquery t
+           :headers (list (cons "Authorization"
+                                (concat "Bearer " (leman-session-token session))))
            :then (lambda (data)
                    (when leman-room-avatars
                      ;; MAYBE: Store the raw image data instead of using create-image here.
@@ -1002,8 +1006,8 @@ and `session' to the session.  Adds function to
                                                 :max-height leman-room-avatar-max-height)))
                        (if (not image)
                            (progn
-                             (display-warning 'leman (format "Room avatar seems unreadable:  ROOM-ID:%S  AVATAR-URL:%S"
-                                                             (leman-room-id room) (leman--mxc-to-url url session)))
+                      (display-warning 'leman (format "Room avatar seems unreadable:  ROOM-ID:%S  AVATAR-URL:%S"
+                                                      (leman-room-id room) (leman--mxc-to-authenticated-url url session)))
                              (setf (leman-room-avatar room) nil
                                    (alist-get 'room-list-avatar (leman-room-local room)) nil))
                          (when (fboundp 'imagemagick-types)
