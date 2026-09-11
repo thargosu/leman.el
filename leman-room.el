@@ -4261,13 +4261,19 @@ If FORMATTED-P, return the formatted body content, when available."
                                ;; Fetch any mxc:// images in the body
                                ;; asynchronously; the event is
                                ;; re-rendered when they arrive.
+                               ;; NOTE: The loop's match position
+                               ;; must be captured before calling
+                               ;; 'leman--mxc-to-authenticated-url',
+                               ;; which clobbers the match data.
                                (let ((start 0))
                                  (while (string-match "mxc://[^\"' >]+" formatted-body start)
-                                   (leman-room--fetch-html-image
-                                    (leman--mxc-to-authenticated-url (match-string 0 formatted-body) session)
-                                    event leman-room
-                                    (leman-session-token session))
-                                   (setf start (match-end 0))))
+                                   (let ((mxc (match-string 0 formatted-body))
+                                         (next (match-end 0)))
+                                     (leman-room--fetch-html-image
+                                      (leman--mxc-to-authenticated-url mxc session)
+                                      event leman-room
+                                      (leman-session-token session))
+                                     (setf start next))))
                                rendered)))
                          (_ (format "[unknown body format: %s] %s"
                                     (or new-content-format content-format) body)))))
