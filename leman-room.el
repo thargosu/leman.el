@@ -286,10 +286,12 @@ In that case, sender names are aligned to the margin edge.")
 (defvar leman-room-matrix.to-url-regexp
   (rx "http" (optional "s") "://"
       "matrix.to" "/#/"
-      (group (or "!" "#") (1+ (not (any "/"))))
+      (group (1+ (not (any "/"))))
       (optional "/" (group "$" (1+ (not (any "?" "/")))))
       (optional "?" (group (1+ anything))))
-  "Regexp matching \"matrix.to\" URLs.")
+  "Regexp matching \"matrix.to\" URLs.
+The first group is the URL-encoded room ID, alias, or user ID;
+the second, the optional event ID.  Both may be percent-encoded.")
 
 (defvar leman-room-message-history nil
   "History list of messages entered with `leman-room' commands.
@@ -1606,6 +1608,30 @@ when switching themes or adjusting `leman-prism' options."
   ;;     (ewoc-refresh leman-ewoc)))
   )
 
+(defun leman-room--find-room-in-session (room-id room-alias session)
+  "Return room in SESSION matching ROOM-ID or ROOM-ALIAS, if any."
+  (or (and room-id (cl-find room-id (leman-session-rooms session)
+                            :key #'leman-room-id :test #'equal))
+      (and room-alias (cl-find room-alias (leman-session-rooms session)
+                               :key #'leman-room-canonical-alias :test #'equal))))
+
+(defun leman-room--browse-url-in-browser (url args)
+  "Open URL in the web browser, bypassing Leman's matrix.to handler.
+ARGS are passed to `browse-url'."
+  (let ((handler (cons leman-room-matrix.to-url-regexp #'leman-room-browse-url)))
+    ;; Note that `browse-url-handlers' was added in 28.1; prior to that
+    ;; `browse-url-browser-function' served double-duty.
+    ;; TODO: Remove compat code when requiring Emacs >=28.
+    ;; (See also `leman-room-mode'.)
+    (cond ((boundp 'browse-url-handlers)
+           (let ((browse-url-handlers (remove handler browse-url-handlers)))
+             (apply #'browse-url url args)))
+          ((consp browse-url-browser-function)
+           (let ((browse-url-browser-function (remove handler browse-url-browser-function)))
+             (apply #'browse-url url args)))
+          (t
+           (apply #'browse-url url args)))))
+
 (defun leman-room-browse-url (url &rest args)
   "Browse URL, using Leman for matrix.to URLs when possible.
 Otherwise, fall back to `browse-url'.  When called outside of an
@@ -1613,58 +1639,61 @@ Otherwise, fall back to `browse-url'.  When called outside of an
 to the session in which to look for URL's room and event.  ARGS
 are passed to `browse-url'."
   (interactive)
-  (when (string-match leman-room-matrix.to-url-regexp url)
-    (let* ((room-id (when (string-prefix-p "!" (match-string 1 url))
-                      (match-string 1 url)))
-           (room-alias (when (string-prefix-p "#" (match-string 1 url))
-                         (match-string 1 url)))
-           (event-id (match-string 2 url))
-           (room (when (or
-                        ;; Compare with current buffer's room.
-                        (and room-id (equal room-id (leman-room-id leman-room)))
-                        (and room-alias (equal room-alias (leman-room-canonical-alias leman-room)))
-                        ;; Compare with other rooms on session.
-                        (and room-id (cl-find room-id (leman-session-rooms leman-session)
-                                              :key #'leman-room-id))
-                        (and room-alias (cl-find room-alias (leman-session-rooms leman-session)
-                                                 :key #'leman-room-canonical-alias)))
-                   leman-room)))
-      (if room
+  (if (not (string-match leman-room-matrix.to-url-regexp url))
+      ;; Not a matrix.to URL: leave it to the browser.
+      (leman-room--browse-url-in-browser url args)
+    ;; NOTE: Room IDs and event IDs in matrix.to URLs may be
+    ;; percent-encoded (e.g. "!"/"#"/"$" as "%21"/"%23"/"%24").  All
+    ;; groups must be extracted before unhexing, since that clobbers
+    ;; the match data.
+    (let* ((target-string (match-string 1 url))
+           (event-string (match-string 2 url))
+           (target (url-unhex-string target-string))
+           (event-id (when event-string
+                       (url-unhex-string event-string)))
+           (room-id (when (string-prefix-p "!" target) target))
+           (room-alias (when (string-prefix-p "#" target) target))
+           ;; Prefer a joined room in the current session, then one in
+           ;; any other session.  FOUND is a (ROOM . SESSION) cons.
+           (found (or (when-let* ((session leman-session)
+                                  (room (leman-room--find-room-in-session
+                                         room-id room-alias session)))
+                        (cons room session))
+                      (cl-loop for (_id . session) in leman-sessions
+                               for room = (leman-room--find-room-in-session
+                                           room-id room-alias session)
+                               when room
+                               return (cons room session)))))
+      (if found
           (progn
-            ;; Found room in current session: view it and find the event.
-            (leman-view-room room leman-session)
-            (when event-id
-              (leman-room-find-event event-id)))
-        ;; Room not joined: offer to join it or load link in browser.
-        (pcase-exhaustive
-            (cadr (leman--read-multiple-choice
-                   (format "Room <%s> not joined on current session.  Join it, or load link with browser?"
-                           (or room-alias room-id))
-                   '((?j "join" "Join room in leman.el")
-                     (?w "web browser" "Open URL in web browser"))
-                   "\
+            ;; Found a joined room: view it and find the event.
+            (pcase-let ((`(,room . ,session) found))
+              (leman-view-room room session)
+              (when event-id
+                (leman-room-find-event event-id))))
+        (pcase target
+          ;; User links aren't handled yet; leave them to the browser.
+          ((pred (string-prefix-p "@"))
+           (leman-room--browse-url-in-browser url args))
+          (_
+           ;; Room not joined: offer to join it or load link in browser.
+           (pcase-exhaustive
+               (cadr (leman--read-multiple-choice
+                      (format "Room <%s> not joined on current session.  Join it, or load link with browser?"
+                              (or room-alias room-id))
+                      '((?j "join" "Join room in leman.el")
+                        (?w "web browser" "Open URL in web browser"))
+                      "\
 You are not currently joined to that room.  You can either join the room
 in leman.el, or visit the link URL in your web browser."))
-          ("join"
-           (leman-join-room (or room-alias room-id) leman-session
-                            :then (when event-id
-                                    (lambda (room session)
-                                      (leman-view-room room session)
-                                      (leman-room-find-event event-id)))))
-          ("web browser"
-           (let ((handler (cons leman-room-matrix.to-url-regexp #'leman-room-browse-url)))
-             ;; Note that `browse-url-handlers' was added in 28.1;
-             ;; prior to that `browse-url-browser-function' served double-duty.
-             ;; TODO: Remove compat code when requiring Emacs >=28.
-             ;; (See also `leman-room-mode'.)
-             (cond ((boundp 'browse-url-handlers)
-                    (let ((browse-url-handlers (remove handler browse-url-handlers)))
-                      (apply #'browse-url url args)))
-                   ((consp browse-url-browser-function)
-                    (let ((browse-url-browser-function (remove handler browse-url-browser-function)))
-                      (apply #'browse-url url args)))
-                   (t
-                    (apply #'browse-url url args))))))))))
+             ("join"
+              (leman-join-room (or room-alias room-id) leman-session
+                               :then (when event-id
+                                       (lambda (room session)
+                                         (leman-view-room room session)
+                                         (leman-room-find-event event-id)))))
+             ("web browser"
+              (leman-room--browse-url-in-browser url args)))))))))
 
 (defun leman-room-find-event (event-id)
   "Go to EVENT-ID in current buffer."
@@ -5511,7 +5540,7 @@ options `leman-room-image-thumbnail-height' and
   "Download image EVENT on SESSION and call THEN, else ELSE.
 If AUTHENTICATEDP, send authenticated request to new
 endpoint (Matrix 1.11, MSC3911); otherwise send old-style,
-unauthenticated request to old endpoint."
+unauthenticated request to old endpoint.""
   (declare (indent defun))
   (pcase-let* (((cl-struct leman-event content) event)
                ((map ('url mxc)) content))
