@@ -301,15 +301,6 @@ which case setting this to nil shows their first frame instead."
   :type 'boolean
   :group 'leman-room-images)
 
-(defcustom leman-room-image-max-fps nil
-  "Maximum frame rate for animated images in message bodies.
-nil means images animate at their native frame rate.  A number
-throttles animated images' timers, which can help in rooms
-containing very many animated images."
-  :type '(choice (const :tag "Native rate (no throttle)" nil)
-                 (natnum :tag "Maximum frames per second"))
-  :group 'leman-room-images)
-
 (defvar leman-room-message-history nil
   "History list of messages entered with `leman-room' commands.
 Does not include filenames, emotes, etc.")
@@ -3981,7 +3972,11 @@ seconds."
   ;; specializer is sufficient, I see no reason not to use it.)
   (pcase-exhaustive thing
     ((pred leman-event-p)
-     (insert "" (leman-room--format-event thing leman-room leman-session)))
+     (let ((beg (point)))
+       (insert "" (leman-room--format-event thing leman-room leman-session))
+       ;; Animations can only be started once the images are in this
+       ;; buffer (see `leman-room--animate-images').
+       (leman-room--animate-images beg (point))))
     ((pred leman-user-p)
      (insert (propertize (leman--format-user thing)
                          'display leman-room-username-display-property)))
@@ -4389,7 +4384,12 @@ HTML is rendered to Emacs text using `shr-insert-document'."
       ;; resized (i.e. the wrapping is adjusted automatically by redisplay
       ;; rather than requiring the message to be re-rendered to HTML).
       (let ((shr-use-fonts leman-room-use-variable-pitch)
-            (shr-image-animate leman-room-animate-message-images)
+            ;; NOTE: Don't let shr start animations here: it anchors
+            ;; them to this temporary buffer, which the rendered text
+            ;; is immediately copied out of, killing them (or making
+            ;; them janky).  They are started in the room buffer by
+            ;; `leman-room--animate-images' instead.
+            (shr-image-animate nil)
             (old-fn (symbol-function 'shr-tag-blockquote))) ;; Bind to a var to avoid unknown-function linting errors.
         (cl-letf (((symbol-function 'shr-fill-line) #'ignore)
                   ;; NOTE: Replace `shr-tag-img' to fetch images
@@ -4436,15 +4436,7 @@ HTML is rendered to Emacs text using `shr-insert-document'."
                              (when-let ((height (shr-string-number (dom-attr dom 'height))))
                                (setf (image-property put-image :max-height) height))
                              (when-let ((width (shr-string-number (dom-attr dom 'width))))
-                               (setf (image-property put-image :max-width) width))
-                             ;; Throttle animation, when configured:
-                             ;; shr starts each animated image's
-                             ;; timer at 60fps, and with very many
-                             ;; images that can overload redisplay.
-                             (when-let ((timer (and leman-room-image-max-fps
-                                                    (image-animate-timer put-image))))
-                               (cancel-timer timer)
-                               (image-animate put-image nil leman-room-image-max-fps)))
+                               (setf (image-property put-image :max-width) width)))
                          (when (display-graphic-p)
                            ;; Non-graphic displays: `shr-put-image'
                            ;; already inserted the alt text.
@@ -4462,6 +4454,30 @@ HTML is rendered to Emacs text using `shr-insert-document'."
           (shr-insert-document
            (libxml-parse-html-region (point-min) (point-max))))))
     (string-trim (buffer-substring (point) (point-max)))))
+
+(defun leman-room--animate-images (beg end)
+  "Start animating multi-frame images between BEG and END.
+Images are rendered by shr in a temporary buffer, where an
+animation cannot be anchored (the rendering is copied out of that
+buffer, and animations must be anchored to where an image is
+actually displayed to keep running and be updated), so instead
+the animations are started here, after the rendering has been
+inserted into the room buffer."
+  (when leman-room-animate-message-images
+    (save-excursion
+      (goto-char beg)
+      (while (< (point) end)
+        (when-let* ((display (get-text-property (point) 'display))
+                    (image (cond ((imagep display) display)
+                                 ((and (consp display) (imagep (car display)))
+                                  (car display))))
+                    ((cdr (image-multi-frame-p image))))
+          ;; Anchoring the animation to this buffer and position
+          ;; makes it stop by itself when the image is no longer
+          ;; displayed here (e.g. its node was re-rendered).
+          (image-animate image nil t (point)))
+        (goto-char (or (next-single-property-change (point) 'display nil end)
+                       end))))))
 
 (cl-defun leman-room--event-mentions-user-p (event user &optional (room leman-room))
   "Return non-nil if EVENT in ROOM mentions USER."
