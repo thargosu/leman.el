@@ -4477,15 +4477,25 @@ HTML is rendered to Emacs text using `shr-insert-document'."
 
 (defvar leman-room-spoiler-keymap
   (let ((map (make-sparse-keymap)))
-    (define-key map [mouse-1] #'leman-room-toggle-spoiler)
+    ;; NOTE: Bind `mouse-2', not `mouse-1': spoilers have a
+    ;; `follow-link' property, so a quick mouse-1 click is translated
+    ;; to a mouse-2 click before key lookup; a mouse-1 binding would
+    ;; never be invoked, and the click would fall through to the
+    ;; global mouse-2 binding (yanking into the read-only buffer).
+    (define-key map [mouse-2] #'leman-room-toggle-spoiler)
     (define-key map (kbd "RET") #'leman-room-toggle-spoiler)
     map)
   "Keymap on spoiler labels and revealed spoiler content.")
 
-(defun leman-room-toggle-spoiler (event)
-  "Toggle visibility of the spoiler at point or where EVENT occurred."
-  (interactive "e")
-  (let* ((start (and (mouse-event-p event) (event-start event)))
+(defun leman-room-toggle-spoiler (&optional event)
+  "Toggle visibility of the spoiler at point or where EVENT occurred.
+EVENT should be a mouse event, or nil to toggle at point.
+NOTE: The interactive spec must accept keyboard invocation (e.g.
+RET), so it cannot use the \"e\" code, which requires a mouse
+event; see also `leman-room-spoiler-keymap'."
+  (interactive
+   (list (and (mouse-event-p last-command-event) last-command-event)))
+  (let* ((start (and event (mouse-event-p event) (event-start event)))
          (pos (if start (posn-point start) (point)))
          (buffer (if start (window-buffer (posn-window start)) (current-buffer))))
     (when (buffer-live-p buffer)

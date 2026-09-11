@@ -356,6 +356,31 @@ Toggling works both from within the content and from its label."
       (leman-room--toggle-spoiler-at-point)
       (should-not (get-text-property (point) 'invisible)))))
 
+(ert-deftest leman-room--spoiler-keymap-and-RET ()
+  "Test that the spoiler keymap works with both mouse and keyboard.
+RET must invoke the command without the \"e\" interactive spec's
+\"must be bound to an event with parameters\" error, and mouse-1
+must not be bound, because the `follow-link' property translates
+quick mouse-1 clicks to mouse-2 clicks before key lookup."
+  (should (eq (lookup-key leman-room-spoiler-keymap (kbd "RET"))
+              #'leman-room-toggle-spoiler))
+  (should (eq (lookup-key leman-room-spoiler-keymap [mouse-2])
+              #'leman-room-toggle-spoiler))
+  (should-not (lookup-key leman-room-spoiler-keymap [mouse-1]))
+  (let ((string (let ((leman-room-use-variable-pitch nil))
+                  (leman-room--render-html
+                   "<span data-mx-spoiler>hidden words</span>" nil))))
+    (with-temp-buffer
+      (insert string)
+      ;; Pressing RET on the label toggles the spoiler.
+      (goto-char (point-min))
+      (search-forward "[spoiler]")
+      (backward-char 3)
+      (let ((last-command-event ?\r))
+        (call-interactively #'leman-room-toggle-spoiler))
+      (let ((cbeg (next-single-property-change (point-min) 'leman-spoiler-content)))
+        (should-not (get-text-property cbeg 'invisible))))))
+
 (provide 'leman-tests)
 
 ;;; leman-tests.el ends here
