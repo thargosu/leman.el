@@ -69,7 +69,7 @@ impl Drop for TestAgent {
             let _ = writeln!(stdin, r#"{{"id":999999,"cmd":"quit"}}"#);
             drop(stdin);
             for _ in 0..100 {
-                if self.child.try_wait().map_or(false, |status| status.is_some()) {
+                if matches!(self.child.try_wait(), Ok(Some(_))) {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
