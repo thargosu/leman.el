@@ -155,7 +155,9 @@ impl Agent {
             .map_err(crypto_error)?;
         let device_id = OwnedDeviceId::from(param_str(&params, "device_id")?);
         let store_path = param_str(&params, "store_path")?;
-        std::fs::create_dir_all(store_path).context("creating store directory")?;
+        tokio::fs::create_dir_all(store_path)
+            .await
+            .context("creating store directory")?;
         let store = matrix_sdk_sqlite::SqliteCryptoStore::open(store_path, None)
             .await
             .context("opening crypto store")
