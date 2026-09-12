@@ -272,7 +272,7 @@ SENT-LINES."
                                                    (list (cons 'id "req1")
                                                          (cons 'method "POST")
                                                          (cons 'path "/_matrix/client/v3/keys/upload")
-                                                         (cons 'body (list (cons 'device_keys (list))))))))))))
+                                                         (cons 'body "{\"device_keys\":{},\"one_time_keys\":{}}")))))))))
          (session (make-leman-session))
          (performed nil))
     (setf (leman-session-e2ee session) (car fake))
@@ -285,30 +285,27 @@ SENT-LINES."
                    "/_matrix/client/v3/keys/upload"))
     (should (equal (alist-get 'id (car performed)) "req1"))))
 
-(ert-deftest leman-e2ee-outgoing-request-encodes-empty-objects ()
-  ;; Outgoing request bodies are re-encoded with `json-serialize',
-  ;; whose nil values become empty objects ({}); homeservers reject
-  ;; null where a JSON object/map is expected (e.g. "one_time_keys").
-  (let* ((fake (leman-e2ee-tests--fake-agent
+(ert-deftest leman-e2ee-outgoing-request-body-passed-through ()
+  ;; Request bodies are pre-encoded JSON strings from the agent; the
+  ;; pump must pass them through verbatim (re-encoding through elisp
+  ;; corrupts empty objects, which elisp cannot represent).
+  (let* ((body "{\"device_keys\":{},\"one_time_keys\":{}}")
+         (fake (leman-e2ee-tests--fake-agent
                 (list (cons 'outgoing_requests
                             (list (cons 'requests (vector
                                                    (list (cons 'id "req1")
                                                          (cons 'method "POST")
                                                          (cons 'path "/_matrix/client/v3/keys/upload")
-                                                         (cons 'body (list (cons 'device_keys (list))
-                                                                           (cons 'one_time_keys (list))))))))))))
+                                                         (cons 'body body)))))))))
          (session (make-leman-session))
          (bodies nil))
     (setf (leman-session-e2ee session) (car fake))
     ;; Stub the HTTP layer and capture the encoded request bodies.
-    ;; NOTE: A plain lambda cannot use &key (that's a `cl-defun'
-    ;; feature); extract the :data argument manually.
     (cl-letf (((symbol-function #'leman-api)
                (lambda (_session _endpoint &rest args)
                  (push (plist-get args :data) bodies))))
       (leman-e2ee--process-outgoing-requests session)
-      (should (string-match-p "\"one_time_keys\":{}" (car bodies)))
-      (should-not (string-match-p "null" (car bodies))))))
+      (should (equal (car bodies) body)))))
 
 (ert-deftest leman-e2ee-push-room-events-decrypts ()
   ;; Full push-path integration: an encrypted timeline event is

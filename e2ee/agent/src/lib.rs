@@ -246,6 +246,15 @@ impl Agent {
                 ),
             };
             self.pending.insert(request_id.clone(), kind);
+            // NOTE: The body is a JSON string, not an embedded object:
+            // elisp cannot encode empty objects (nil becomes either
+            // null or {} depending on the encoder), so round-tripping
+            // a serialized body through elisp would corrupt it (e.g.
+            // "timeout":null becoming "timeout":{}, which homeservers
+            // reject).  The client passes the string through verbatim.
+            let body = serde_json::to_string(&body)
+                .context("serializing request body")
+                .map_err(crypto_error)?;
             serialized.push(json!({
                 "id": request_id,
                 "method": method,

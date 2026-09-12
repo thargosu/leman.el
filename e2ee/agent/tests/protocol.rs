@@ -122,8 +122,15 @@ async fn exchange_and_encrypt(agent: &mut TestAgent, alice: &OlmMachine) -> Valu
         request["path"].as_str().unwrap().contains("/keys/upload"),
         "expected keys upload request: {request}"
     );
-    let bob_device_keys = request["body"]["device_keys"].clone();
-    let bob_one_time_keys = request["body"]["one_time_keys"].clone();
+    // The body is a JSON string, passed through the client verbatim.
+    assert!(
+        request["body"].is_string(),
+        "request body must be a JSON string: {request}"
+    );
+    let body: Value =
+        serde_json::from_str(request["body"].as_str().unwrap()).expect("valid body JSON");
+    let bob_device_keys = body["device_keys"].clone();
+    let bob_one_time_keys = body["one_time_keys"].clone();
     agent.request(
         "mark_request_as_sent",
         json!({"request_id": request["id"], "response": {"one_time_key_counts": {}}}),

@@ -55,17 +55,21 @@ agent holds exactly one machine.
 ** ~outgoing_requests~
 
 Returns the HTTP requests the state machine wants performed, as
-~{method, path, body}~ triples.  The client performs them with its own
-authentication and reports the result with ~mark_request_as_sent~.
-Requests may be re-returned if not yet marked as sent.
+~{method, path, body}~ triples.  ~body~ is the request body
+pre-encoded as a JSON string: elisp cannot represent empty JSON
+objects, so round-tripping a serialized body through elisp would
+corrupt it (e.g. ~"timeout":null~ becoming ~"timeout":{}~).  The
+client performs the request verbatim with its own authentication
+and reports the result with ~mark_request_as_sent~.  Requests may
+be re-returned if not yet marked as sent.
 
 #+begin_src json
 {"id": 3, "cmd": "outgoing_requests"}
 {"id": 3, "ok": {"requests": [
   {"id": "<request-id>", "method": "POST",
-   "path": "/_matrix/client/v3/keys/upload", "body": {...}},
+   "path": "/_matrix/client/v3/keys/upload", "body": "{\"device_keys\":{...}}"},
   {"id": "<request-id>", "method": "PUT",
-   "path": "/_matrix/client/v3/sendToDevice/m.room.encrypted/<txn>", "body": {...}}]}}
+   "path": "/_matrix/client/v3/sendToDevice/m.room.encrypted/<txn>", "body": "{...}"}]}}
 #+end_src
 
 ** ~mark_request_as_sent~
