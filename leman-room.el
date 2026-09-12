@@ -3363,6 +3363,9 @@ function to `leman-room-event-fns', which see."
   (with-silent-modifications
     (leman-room--insert-event event)))
 
+(leman-room-defevent "m.room.encrypted"
+  (leman-room--insert-event event))
+
 (leman-room-defevent "m.room.message"
   (pcase-let* (((cl-struct leman-event content unsigned) event)
                ((map ('m.relates_to (map ('rel_type rel-type) ('event_id replaces-event-id)))) content)
@@ -4141,6 +4144,15 @@ Formats according to `leman-room-message-format-spec', which see."
              (leman-room--format-power-levels-event event room session))
             ("m.room.canonical_alias"
              (leman-room--format-canonical-alias-event event room session))
+            ;; NOTE: Only undecryptable events have this type in the
+            ;; buffer: successfully decrypted ones are made into
+            ;; events of their decrypted type before rendering.
+            ("m.room.encrypted"
+             (leman-room-wrap-prefix
+               (format "%s sent an encrypted message (unable to decrypt)."
+                       (propertize (leman--user-displayname-in room (leman-event-sender event))
+                                   'help-echo (leman-user-id (leman-event-sender event))))
+               'face 'leman-room-membership))
             (_ (leman-room-wrap-prefix
                  (format "[sender:%s type:%s]"
                          (leman-user-id (leman-event-sender event))

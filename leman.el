@@ -320,8 +320,9 @@ user is prompted."
   (setf (alist-get (leman-user-id (leman-session-user session))
                    leman-sessions nil nil #'equal)
         session)
-  (leman-e2ee--start-agent session)
-  (leman--sync session :timeout leman-initial-sync-timeout))
+  (leman-e2ee--start-agent session
+                           (lambda ()
+                             (leman--sync session :timeout leman-initial-sync-timeout))))
 
 (defun leman--connect-args ()
   "Return arguments for interactively calling `leman-connect'.
@@ -424,19 +425,51 @@ Useful in, e.g. `leman-disconnect-hook', which see."
 
 ;;;;; E2EE integration
 
-(defun leman-e2ee--start-agent (session)
-  "Start an E2EE agent for SESSION, if not already running.
-If the agent program is unavailable, disable E2EE for SESSION
-with a message."
-  (unless (leman-session-e2ee session)
-    (let ((user-id (leman-user-id (leman-session-user session)))
-          (device-id (leman-session-device-id session)))
-      (if (and user-id device-id)
-          (condition-case err
-              (setf (leman-session-e2ee session)
-                    (leman-e2ee-start user-id device-id))
-            (error (leman-message "Leman E2EE unavailable: %s" (error-message-string err))))
-        (leman-message "Leman E2EE disabled: device ID unknown.")))))
+(defun leman-e2ee--start-agent (session &optional then)
+  "Start an E2EE agent for SESSION, then call THEN, if given.
+THEN is also called when the agent can't be started (after a
+message is shown).  If SESSION has no device ID (e.g. the session
+was restored from disk, which doesn't save device IDs), it is
+fetched with the whoami API first."
+  (cl-labels ((start-agent
+               ()
+               (let ((user-id (leman-user-id (leman-session-user session)))
+                     (device-id (leman-session-device-id session)))
+                 (if (and user-id device-id)
+                     (condition-case err
+                         (setf (leman-session-e2ee session)
+                               (leman-e2ee-start user-id device-id))
+                       (error (leman-message "Leman E2EE unavailable: %s"
+                                             (error-message-string err))))
+                   (leman-message "Leman E2EE disabled: device ID unknown."))))
+              (finish
+               ()
+               (when then (funcall then))))
+    (if (leman-session-device-id session)
+        (progn (start-agent)
+               (finish))
+      (leman-api session "account/whoami"
+        :then (lambda (data)
+                (setf (leman-session-device-id session) (alist-get 'device_id data))
+                (start-agent)
+                (finish))
+        :else (lambda (plz-error)
+                (leman-message "Leman E2EE disabled: unable to fetch device ID: %S" plz-error)
+                (finish))))))
+
+(defun leman-e2ee-status (session)
+  "Show the E2EE status of SESSION in the echo area."
+  (interactive (list (leman-complete-session)))
+  (let ((agent (leman-session-e2ee session)))
+    (if (not agent)
+        (message "Leman E2EE: no agent running for %s."
+                 (leman-user-id (leman-session-user session)))
+      (message "Leman E2EE: agent %s for %s on device %s (log buffer: %s)"
+               (if (process-live-p (leman-e2ee-process agent))
+                   "running" "NOT RUNNING")
+               (leman-e2ee-user-id agent)
+               (leman-e2ee-device-id agent)
+               (buffer-name (leman-e2ee-log-buffer agent))))))
 
 (defun leman-e2ee--decrypt-event (session event &optional room-id)
   "Decrypt EVENT (from ROOM-ID) with SESSION's E2EE agent.

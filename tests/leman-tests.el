@@ -540,6 +540,18 @@ property for toggling."
     ;; body extracted) without signaling an error.
     (should (text-property-not-all 0 (length chip) 'display nil chip))))
 
+(ert-deftest leman-room--format-event-undecryptable ()
+  "Undecryptable encrypted events show a placeholder, not raw content."
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (event (make-leman-event :id "$enc"
+                                  :sender (make-leman-user :id "@other:example.com")
+                                  :type "m.room.encrypted"
+                                  :content '((algorithm . "m.megolm.v1.aes-sha2")
+                                             (ciphertext . "secret")))))
+    (let ((formatted (leman-room--format-event event room nil)))
+      (should (string-match-p "unable to decrypt" formatted))
+      (should-not (string-match-p "secret" formatted)))))
+
 (provide 'leman-tests)
 
 ;;; leman-tests.el ends here
