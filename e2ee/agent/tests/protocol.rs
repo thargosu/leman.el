@@ -311,6 +311,47 @@ fn test_initialize() {
     assert_eq!(ok["user_id"], json!("@bob:example.org"));
 }
 
+/// The elisp side re-encodes sync data with `json-serialize', which
+/// encodes absent sync fields (nil) as empty objects ({}), not null.
+/// The agent must accept both forms for all optional sync fields.
+#[tokio::test]
+async fn test_receive_sync_changes_accepts_empty_objects() {
+    let mut agent = TestAgent::spawn();
+    let store = TempDir::new().unwrap();
+    let initialize = agent.request("initialize", initialize_params(&store));
+    assert!(initialize["ok"].is_object());
+
+    let response = agent.request(
+        "receive_sync_changes",
+        json!({
+            "to_device_events": [],
+            "changed_devices": {},
+            "one_time_keys_count": {},
+            "unused_fallback_keys": {},
+            "next_batch_token": "s1",
+        }),
+    );
+    assert!(
+        response["ok"].is_object(),
+        "empty objects must be accepted: {response}"
+    );
+
+    let response = agent.request(
+        "receive_sync_changes",
+        json!({
+            "to_device_events": [],
+            "changed_devices": null,
+            "one_time_keys_count": null,
+            "unused_fallback_keys": null,
+            "next_batch_token": "s2",
+        }),
+    );
+    assert!(
+        response["ok"].is_object(),
+        "nulls must be accepted: {response}"
+    );
+}
+
 /// The flagship round trip: Alice shares a room key with Bob (the
 /// agent), then sends an encrypted event which the agent decrypts.
 /// The test harness acts as the virtual homeserver.

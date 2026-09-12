@@ -527,10 +527,14 @@ When it succeeds, report the response to the agent."
   (pcase-let* (((map ('id id) ('method method) ('path path) ('body body)) request)
                (`(,version ,endpoint) (leman-e2ee--split-path path))
                (method (intern (downcase method))))
+    ;; NOTE: Re-encode the agent's body with `json-serialize', not
+    ;; `json-encode': the former encodes nil as an empty object ({})
+    ;; (which homeservers expect, e.g. for "one_time_keys"), while
+    ;; the latter encodes it as null (which they reject).
     (leman-api session endpoint
                :method method
                :version version
-               :data (json-encode body)
+               :data (json-serialize body)
                :then (lambda (data)
                        (condition-case err
                            (leman-e2ee-mark-request-as-sent agent id data)

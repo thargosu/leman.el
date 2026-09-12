@@ -357,14 +357,18 @@ impl Agent {
                     .context("parsing one_time_keys_count")
                     .map_err(crypto_error)?,
             };
-        let unused_fallback_keys: Option<Vec<OneTimeKeyAlgorithm>> = serde_json::from_value(
-            params
-                .get("unused_fallback_keys")
-                .cloned()
-                .unwrap_or(Value::Null),
-        )
-        .context("parsing unused_fallback_keys")
-        .map_err(crypto_error)?;
+        let unused_fallback_keys: Option<Vec<OneTimeKeyAlgorithm>> = match params
+            .get("unused_fallback_keys")
+        {
+            // NOTE: The client sends an empty object ({}), not null,
+            // for absent sync fields; elisp cannot encode null
+            // objects.
+            Some(Value::Null) | None => None,
+            Some(Value::Object(object)) if object.is_empty() => None,
+            Some(value) => serde_json::from_value(value.clone())
+                .with_context(|| format!("parsing unused_fallback_keys: {value}"))
+                .map_err(crypto_error)?,
+        };
         let next_batch_token: Option<String> = params
             .get("next_batch_token")
             .and_then(Value::as_str)
