@@ -168,8 +168,65 @@ before encryption).
 
 * Planned (E2+)
 
-+ ~encrypt_room_event~: encrypt outgoing content with Megolm,
-  incl. ~share_room_key~/~get_missing_sessions~ handled internally.
 + ~export_keys~/~import_keys~: room key export files.
 + Verification commands (emoji/QR SAS via MSC4108).
+
+* E2: encrypting outgoing events (specified, in development)
+
+** ~encrypt_room_event~
+
+Encrypts an event's content with Megolm for ROOM-ID.  The client
+passes the room's member user IDs (~users~), which the machine needs
+to track devices for key sharing (the client should have called
+~update_tracked_users~ with them beforehand).  Content is the
+plaintext event content; the agent never sees it after encryption
+(the plaintext is not persisted).
+
+#+begin_src json
+{"id": 8, "cmd": "encrypt_room_event", "params": {
+  "room_id": "!room:example.org",
+  "event_type": "m.room.message",
+  "content": {"msgtype": "m.text", "body": "hello"},
+  "users": ["@alice:example.org"]}}
+#+end_src
+
+Two possible responses.  If the machine is missing Olm sessions with
+some member devices, the keys must be claimed first:
+
+#+begin_src json
+{"id": 8, "ok": {"status": "claims_pending"}}
+#+end_src
+
+The client then performs the pending ~keys/claim~ (and any other)
+outgoing requests, marks them as sent, and retries the command.  Once
+sessions exist, the agent shares a room key with the members' devices
+(the ~sendToDevice~ requests appear in ~outgoing_requests~ and must
+be performed before other clients can decrypt) and encrypts:
+
+#+begin_src json
+{"id": 8, "ok": {"status": "ok", "event": {
+  "type": "m.room.encrypted",
+  "content": {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "...",
+              "sender_key": "...", "session_id": "..."}}}}
+#+end_src
+
+The client sends the returned event via
+~PUT /rooms/{room_id}/send/m.room.encrypted/{txn_id}~ with its own
+transaction ID; this request is an ordinary API request, not an
+agent outgoing request.
+
+Retry policy: the client retries while the status is
+~claims_pending~, performing outgoing requests between attempts,
+bounded (e.g. 3 attempts) to avoid loops.
+
+** Send flow (client side)
+
+1. Check the room is encrypted (~m.room.encryption~ state event).
+2. ~update_tracked_users~ with the room's member IDs.
+3. ~encrypt_room_event~ (retry on ~claims_pending~, pumping outgoing
+   requests between attempts; pump afterwards too, so key shares are
+   sent).
+4. ~PUT .../send/m.room.encrypted/{txn}~ with the encrypted event.
+5. Pump outgoing requests once more (key distribution continues in
+   the background for newly seen devices).
 + Key backup commands (SSSS).

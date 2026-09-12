@@ -14,7 +14,9 @@ inherited from upstream.)
 | Custom-emoji reactions        | done   | mxc:// keys rendered as images; toggling           |
 | Threads (MSC3440), phase 1    | done   | Aggregation, chips, thread view, replies, edits    |
 | Threads, phase 2              | next   | See below                                          |
-| E2EE                          | urgent | Pantalaimon archived (2026-04); design needed      |
+| E2EE, phase 1 (decrypt)       | done   | Agent + sync integration; verified against a real homeserver |
+| E2EE, phase 2 (encrypt-send)  | next   | See E2 spec in ~e2ee/PROTOCOL.org~                 |
+| E2EE, phase 3+ (verify, backup) | later | See below                                          |
 | UI rework                     | vision | See plan below                                     |
 
 * Threads, phase 2 (polish)
@@ -64,10 +66,31 @@ Design decision needed first:
 Phasing:
 
 1. *Decrypt-only* ("E1"): agent + sync integration; encrypted rooms
-   readable, placeholders for undecryptable events, retry on key
-   receipt.  Read-only, no risk of corrupting anything.
+   readable, placeholders for undecryptable events.  DONE 2026-09-12.
+   + Working: agent subprocess (matrix-sdk-crypto 0.18, SQLite store),
+     sync integration (to-device events, device lists, OTK counts fed
+     before ~next_batch~ is persisted), outgoing request pump
+     (keys/upload, query, claim, sendToDevice, signature upload),
+     decryption of live and retro events, placeholder rendering,
+     identity/OTK key uploads, room key receipt, cross-client
+     interoperability (Element, FluffyChat) verified on a real
+     homeserver.
+   + Deferred: retrying undecryptable events when keys arrive later
+     (needs key backup, E4, to be useful).
+   + Lessons learned, worth keeping:
+     - Elisp cannot represent empty JSON objects: ~json-serialize~
+       encodes nil as ~{}~ while ~json-encode~ encodes it as ~null~.
+       Server-bound payloads must never be round-tripped through
+       elisp; the agent passes request bodies as pre-encoded JSON
+       strings and the client performs them verbatim.
+     - Saved sessions must fetch the device ID (whoami) before
+       starting the agent; the crypto store is keyed by device, so a
+       nil device ID silently disables E2EE.
+     - The live sync path deduplicates events by ID (re-delivery
+       after a limited timeline otherwise shows duplicates).
 2. *Encrypt-send* ("E2"): send encrypted messages, automatic key
-   distribution to member devices.
+   distribution to member devices.  Spec in ~e2ee/PROTOCOL.org~
+   (encrypt_room_event).
 3. *Verification* ("E3"): emoji/QR verification via the state
    machine; key import/export (export file GPG-encrypted by elisp).
 4. *Key backup* ("E4"): SSSS for cross-device history.
