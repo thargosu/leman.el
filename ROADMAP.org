@@ -1,0 +1,144 @@
+#+TITLE: Leman Roadmap
+
+Roadmap and plans for Leman.el.  (Supersedes the notes lost with
+the old ~meta/notes~ worktree; ~NOTES.org~ remains a symlink
+inherited from upstream.)
+
+* Status
+
+| Area                          | Status | Notes                                              |
+|-------------------------------+--------+----------------------------------------------------|
+| Spoilers (MSC2014)            | done   | Rendered, toggled with RET or mouse                |
+| Desktop notifications         | done   | D-Bus; predicates for mentions/unread/open buffers |
+| Unread mode-line indicator    | done   | % escaping, RET/mouse-2 keymap                     |
+| Custom-emoji reactions        | done   | mxc:// keys rendered as images; toggling           |
+| Threads (MSC3440), phase 1    | done   | Aggregation, chips, thread view, replies, edits    |
+| Threads, phase 2              | next   | See below                                          |
+| E2EE                          | urgent | Pantalaimon archived (2026-04); design needed      |
+| UI rework                     | vision | See plan below                                     |
+
+* Threads, phase 2 (polish)
+
++ Room-level thread list (~GET /v1/rooms/{id}/threads~), e.g. ~s T~.
++ Mark threads read when viewed (threaded read receipts).
++ Org/HTML composition for thread replies (currently single-line minibuffer).
++ Clean up redacted thread replies (currently stale).
++ Live-update open thread views (partially done: done for new replies via sync).
+
+* E2EE
+
+Pantalaimon was archived on 2026-04-08; its design (MITM proxy +
+libolm) is deprecated.  State of the ecosystem as of 2026-09:
+
++ *vodozemac* 0.11.0 (pure Rust): the reference implementation of
+  Olm/Megolm, audited; also provides SAS and MSC4108 verification.
++ *matrix-rust-sdk*: production-ready client SDK (Element X, Fractal,
+  iamb, Robrix).  Its ~matrix-sdk-crypto~ crate is a standalone
+  encryption state machine with no network I/O: callers feed it
+  to-device messages and encrypted events, and it returns decrypted
+  events plus outbound requests (key distribution) to send.
++ *libolm*: deprecated upstream; only Pantalaimon and old clients.
++ *Element*: Web/Desktop uses matrix-js-sdk + Rust crypto compiled to
+  WASM (matrix-sdk-crypto-wasm); Element X uses matrix-rust-sdk via
+  UniFFI bindings (Kotlin/Swift; Python/Ruby for crypto-ffi).
++ *FluffyChat*: Rust FFI natively, vodozemac WASM on web.
++ *Spec v1.19* (2026-07): proper history sharing when joining
+  encrypted rooms; QR/emoji verification via MSC4108 in vodozemac.
+
+Design decision needed first:
+
+1. *Subprocess agent around matrix-sdk-crypto* (preferred): a small
+   Rust binary speaking line-delimited JSON over stdio, holding the
+   crypto state machine and a SQLite store; Emacs feeds sync
+   to-device events and m.room.encrypted events, receives decrypted
+   events and outbound requests, and performs the requests via
+   ~leman-api~.  Mirrors how the official wasm/Node bindings work;
+   no Emacs module compilation issues; crash-isolated; needs the Rust
+   toolchain to build (not currently installed).
+2. *Dynamic module (C FFI)*: thin C shim over matrix-sdk-crypto or
+   vodozemac, loaded via the Emacs module API.  In-process and fast,
+   but requires maintaining C glue + module lifecycle discipline, and
+   bindings for the full state machine are not trivial.
+3. *Pantalaimon-style proxy*: deprecated; only as a last resort.
+
+Phasing:
+
+1. *Decrypt-only* ("E1"): agent + sync integration; encrypted rooms
+   readable, placeholders for undecryptable events, retry on key
+   receipt.  Read-only, no risk of corrupting anything.
+2. *Encrypt-send* ("E2"): send encrypted messages, automatic key
+   distribution to member devices.
+3. *Verification* ("E3"): emoji/QR verification via the state
+   machine; key import/export (export file GPG-encrypted by elisp).
+4. *Key backup* ("E4"): SSSS for cross-device history.
+
+TDD workflow (tests before code; monorepo, agent in ~e2ee/~):
+
+1. *Spec first*: ~e2ee/PROTOCOL.org~ pins every request/response
+   shape (one JSON object per line; ~{"id":N,"cmd":...}~ ->
+   ~{"id":N,"ok":...}~ / ~{"id":N,"err":...}~; ~hello~ does version
+   negotiation).
+2. *Rust tests* (~cargo test~) using ~matrix-sdk-test~ fixtures
+   (the same alice/bob integration style as matrix-sdk-crypto): a
+   two-machine key exchange and encrypt/decrypt round trip driven
+   through the *protocol layer*, plus framing, error mapping, and
+   store persistence across agent restarts.
+3. *Elisp tests* (ERT) against a fake in-memory transport: request
+   id correlation, timeouts, error mapping, sync hook (to-device
+   events processed before persisting ~next_batch~).
+4. *Contract fixtures*: shared JSON fixtures (vendored from
+   matrix-sdk-crypto test data) run through both implementations
+   must agree.
+
+* UI rework plan
+
+Goal: /Element's information architecture + Magit's interaction model +
+Org's folding + Transient's menus + svg-lib's visual polish + Emacs's
+text and navigation semantics./
+
+Inspirations to draw from (not to copy): Magit (contextual operations,
+point-driven menus), Treemacs (sidebar behavior), Elfeed/notmuch/mu4e
+(message-oriented navigation), Org (folding, structured documents),
+Casual/Transient (discoverability), svg-lib (visual vocabulary beyond
+faces and ASCII).
+
+Design constraints:
+
++ Keep EWOC for room buffers (it is what makes them scale).
++ Everything stays selectable, searchable text underneath the polish.
++ Window layouts must remain bookmarkable (e.g. Burly).
+
+Phases:
+
+** Phase 1: Sidebar
+Side-window ~*Leman Sidebar*~ on the left: magit-section room list
+(reusing taxy grouping: favorites, low-priority, DMs, spaces), room
+avatars, svg-lib unread badges (distinct mention badge), topic snippet.
+RET/click to view; auto-follow recent activity.  Dedicated window that
+survives ~delete-other-windows~.
+
+** Phase 2: Messages as Magit sections
+Each event a magit-section in room buffers: ~n~/~p~/~M-n~/~M-p~ section
+motion, point-driven context.  Split the room transient into a message
+transient (react, reply, thread, edit, redact, copy link), with
+unavailable actions grayed out per event type.
+
+** Phase 3: Org-style folding
+Threads foldable inline at the root message (the thread view buffer
+remains for the focused case); date headers and coalesced
+membership-event runs collapsible.
+
+** Phase 4: svg-lib polish
+svg-lib tags/badges/chips for header-line room state (encryption,
+notification mode), typing indicator, connection status, and the
+reaction picker.
+
+* Carry-overs
+
++ Typing indicator display (sending already works; EWOC header/footer).
++ Left-room cleanup in sync (stale room structs/buffers).
++ Session persistence (~persist~/~multisession~) for display names,
+  avatars, read markers.
++ Sync robustness: auto-resync on failure, filter IDs.
++ Room directory: pagination, avatars.
++ Animated custom-emoji reactions (currently static first frame).
