@@ -4313,7 +4313,11 @@ string."
                      (or (alist-get 'count summary) 0))))
     (if (> count 0)
         (let* ((latest-event (or (car (cl-sort (copy-sequence local-events) #'> :key #'leman-event-origin-server-ts))
-                                 (alist-get 'latest_event summary)))
+                                 ;; NOTE: The summary's "latest_event" is
+                                 ;; a raw event alist; make it into an
+                                 ;; event struct for uniform access.
+                                 (when-let ((raw (alist-get 'latest_event summary)))
+                                   (leman--make-event raw))))
                (snippet (when latest-event
                           (truncate-string-to-width
                            (or (map-elt (leman-event-content latest-event) 'body) "")

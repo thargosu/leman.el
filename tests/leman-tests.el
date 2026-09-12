@@ -476,16 +476,6 @@ property for toggling."
                                           'leman-reaction-key string)
                        "mxc://example.com/emoji"))))))
 
-(defun leman-tests--thread-reply-event (id root-id &optional ts)
-  "Return a thread reply event with ID relating to ROOT-ID."
-  (make-leman-event :id id
-                    :origin-server-ts (or ts 1000)
-                    :sender (make-leman-user :id "@other:example.com")
-                    :content `((msgtype . "m.text")
-                               (body . ,(format "reply %s" id))
-                               (m.relates_to . ((rel_type . "m.thread")
-                                                (event_id . ,root-id))))))
-
 (ert-deftest leman-room--thread-data ()
   "Test storing, deduplicating, and replacing thread events."
   (let ((room (make-leman-room :id "!room:example.com"))
@@ -534,7 +524,21 @@ property for toggling."
          (root (make-leman-event :id "$root2"
                                  :unsigned '((m.relations . ((m.thread . ((count . 5))))))))
          (chip (leman-room--format-thread-chip root room)))
-    (should (string-match-p "🧵 5" chip))))
+    (should (string-match-p "🧵 5" chip)))
+  ;; A summary's "latest_event" is a raw event alist, not an event
+  ;; struct; the chip must show its body without signaling an error.
+  (let* ((room (make-leman-room :id "!room:example.com"))
+         (latest-event '((type . "m.room.message")
+                         (content . ((body . "Latest reply")))))
+         (root (make-leman-event :id "$root3"
+                                 :unsigned `((m.relations . ((m.thread . ((count . 1)
+                                                                          (latest_event . ,latest-event))))))))
+         (chip (leman-room--format-thread-chip root room)))
+    (should (string-match-p "🧵 1" chip))
+    ;; The snippet is rendered as a display property; this proves the
+    ;; raw "latest_event" was converted to an event struct (and its
+    ;; body extracted) without signaling an error.
+    (should (text-property-not-all 0 (length chip) 'display nil chip))))
 
 (provide 'leman-tests)
 
