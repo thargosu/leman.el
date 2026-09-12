@@ -63,6 +63,18 @@ impl TestAgent {
 
 impl Drop for TestAgent {
     fn drop(&mut self) {
+        // Ask the agent to exit cleanly first: a SIGKILLed process
+        // never writes its coverage profile.
+        if let Some(mut stdin) = self.child.stdin.take() {
+            let _ = writeln!(stdin, r#"{{"id":999999,"cmd":"quit"}}"#);
+            drop(stdin);
+            for _ in 0..100 {
+                if self.child.try_wait().map_or(false, |status| status.is_some()) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
