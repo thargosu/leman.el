@@ -1,0 +1,25 @@
+[package]
+name = "leman-agent"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "E2EE subprocess agent for Leman.el, wrapping matrix-sdk-crypto"
+publish = false
+
+[[bin]]
+name = "leman-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+matrix-sdk-crypto = "0.18"
+matrix-sdk-sqlite = { version = "0.18", default-features = false, features = ["crypto-store"] }
+ruma = { version = "0.16", features = ["client-api"] }
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync"] }
+
+matrix-sdk-common = "0.18"
+
+[dev-dependencies]
+tempfile = "3"

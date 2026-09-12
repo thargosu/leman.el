@@ -1,0 +1,460 @@
+//! Leman E2EE agent: a JSON-line protocol over stdio wrapping the
+//! matrix-sdk-crypto state machine.  See e2ee/PROTOCOL.org.
+
+use std::collections::BTreeMap;
+
+use anyhow::{anyhow, Context, Result};
+use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
+use matrix_sdk_crypto::{
+    types::events::room::encrypted::EncryptedEvent, types::requests::AnyOutgoingRequest,
+    DecryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement,
+};
+use ruma::{
+    api::client as client_api,
+    events::{AnyToDeviceEvent, MessageLikeEventContent},
+    serde::Raw,
+    OneTimeKeyAlgorithm, OwnedDeviceId, OwnedTransactionId, OwnedUserId, UInt,
+};
+use serde_json::{json, Value};
+
+/// What the main loop should do after handling a line.
+pub enum Flow {
+    /// Send this (possibly empty) response and keep running.
+    Respond(String),
+    /// Send this response and exit.
+    Quit(String),
+}
+
+/// Error codes for the protocol's `err` responses.
+enum AgentError {
+    UnknownCommand(String),
+    NotInitialized,
+    Crypto(anyhow::Error),
+}
+
+impl AgentError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownCommand(_) => "unknown_command",
+            Self::NotInitialized => "not_initialized",
+            Self::Crypto(_) => "crypto",
+        }
+    }
+}
+
+impl std::fmt::Display for AgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownCommand(command) => write!(f, "unknown command: {command}"),
+            Self::NotInitialized => write!(f, "not initialized"),
+            Self::Crypto(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+type CommandResult = Result<Value, AgentError>;
+
+impl From<anyhow::Error> for AgentError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Crypto(error)
+    }
+}
+
+/// The kind of a pending outgoing request, remembered so the response
+/// can be reconstructed when the client reports it as sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingKind {
+    KeysUpload,
+    KeysQuery,
+    KeysClaim,
+    ToDevice,
+    SignatureUpload,
+    RoomMessage,
+}
+
+/// The agent: a single OlmMachine plus bookkeeping for the protocol.
+pub struct Agent {
+    machine: Option<OlmMachine>,
+    pending: BTreeMap<String, PendingKind>,
+}
+
+impl Default for Agent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Agent {
+    pub fn new() -> Self {
+        Self {
+            machine: None,
+            pending: BTreeMap::new(),
+        }
+    }
+
+    fn machine(&self) -> Result<&OlmMachine, AgentError> {
+        self.machine.as_ref().ok_or(AgentError::NotInitialized)
+    }
+
+    /// Handle one protocol line.
+    pub async fn handle_line(&mut self, line: &str) -> Result<Flow, anyhow::Error> {
+        if line.trim().is_empty() {
+            return Ok(Flow::Respond(String::new()));
+        }
+        let message: Value = match serde_json::from_str::<Value>(line) {
+            Ok(value) if value.is_object() => value,
+            Ok(_) => {
+                return Ok(Flow::Respond(
+                    json!({"err": {"code": "parse", "message": "protocol messages must be JSON objects"}})
+                        .to_string(),
+                ))
+            }
+            Err(error) => {
+                return Ok(Flow::Respond(
+                    json!({"err": {"code": "parse", "message": error.to_string()}}).to_string(),
+                ))
+            }
+        };
+        let id = message.get("id").cloned().unwrap_or(Value::Null);
+        let command = message
+            .get("cmd")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+
+        if command == "quit" {
+            return Ok(Flow::Quit(json!({"id": id, "ok": {"bye": true}}).to_string()));
+        }
+
+        let response = match self.handle_command(&command, params).await {
+            Ok(ok) => json!({"id": id, "ok": ok}),
+            Err(error) => {
+                json!({"id": id, "err": {"code": error.code(), "message": error.to_string()}})
+            }
+        };
+        Ok(Flow::Respond(response.to_string()))
+    }
+
+    async fn handle_command(&mut self, command: &str, params: Value) -> CommandResult {
+        match command {
+            "hello" => Ok(json!({"protocol_version": 1})),
+            "initialize" => self.initialize(params).await,
+            "outgoing_requests" => self.outgoing_requests().await,
+            "mark_request_as_sent" => self.mark_request_as_sent(params).await,
+            "receive_sync_changes" => self.receive_sync_changes(params).await,
+            "decrypt_room_event" => self.decrypt_room_event(params).await,
+            "update_tracked_users" => self.update_tracked_users(params).await,
+            other => Err(AgentError::UnknownCommand(other.to_owned())),
+        }
+    }
+
+    async fn initialize(&mut self, params: Value) -> CommandResult {
+        let user_id: OwnedUserId = param_str(&params, "user_id")?
+            .parse()
+            .map_err(crypto_error)?;
+        let device_id = OwnedDeviceId::from(param_str(&params, "device_id")?);
+        let store_path = param_str(&params, "store_path")?;
+        std::fs::create_dir_all(store_path).context("creating store directory")?;
+        let store = matrix_sdk_sqlite::SqliteCryptoStore::open(store_path, None)
+            .await
+            .context("opening crypto store")
+            .map_err(crypto_error)?;
+        let machine = OlmMachine::with_store(&user_id, &device_id, store, None)
+            .await
+            .map_err(crypto_error)?;
+        let identity_keys = machine.identity_keys();
+        let response = json!({
+            "user_id": user_id,
+            "device_id": device_id,
+            "identity_keys": {
+                "curve25519": identity_keys.curve25519.to_base64(),
+                "ed25519": identity_keys.ed25519.to_base64(),
+            },
+        });
+        self.machine = Some(machine);
+        Ok(response)
+    }
+
+    async fn outgoing_requests(&mut self) -> CommandResult {
+        let machine = self.machine()?;
+        let requests = machine
+            .outgoing_requests()
+            .await
+            .map_err(crypto_error)?;
+        let mut serialized = Vec::new();
+        for request in requests {
+            let request_id = request.request_id().to_string();
+            let (kind, method, path, body) = match request.request() {
+                AnyOutgoingRequest::KeysUpload(request) => (
+                    PendingKind::KeysUpload,
+                    "POST".to_owned(),
+                    "/_matrix/client/v3/keys/upload".to_owned(),
+                    json!({
+                        "device_keys": request.device_keys,
+                        "one_time_keys": request.one_time_keys,
+                        "fallback_keys": request.fallback_keys,
+                    }),
+                ),
+                AnyOutgoingRequest::KeysClaim(request) => (
+                    PendingKind::KeysClaim,
+                    "POST".to_owned(),
+                    "/_matrix/client/v3/keys/claim".to_owned(),
+                    json!({
+                        "one_time_keys": request.one_time_keys,
+                        "timeout": request.timeout.map(|timeout| timeout.as_millis() as u64),
+                    }),
+                ),
+                AnyOutgoingRequest::SignatureUpload(request) => (
+                    PendingKind::SignatureUpload,
+                    "POST".to_owned(),
+                    "/_matrix/client/v3/keys/upload_signatures".to_owned(),
+                    json!({"signed_keys": request.signed_keys}),
+                ),
+                AnyOutgoingRequest::KeysQuery(request) => (
+                    PendingKind::KeysQuery,
+                    "POST".to_owned(),
+                    "/_matrix/client/v3/keys/query".to_owned(),
+                    json!({
+                        "device_keys": request.device_keys,
+                        "timeout": request.timeout.map(|timeout| timeout.as_millis() as u64),
+                    }),
+                ),
+                AnyOutgoingRequest::ToDeviceRequest(request) => (
+                    PendingKind::ToDevice,
+                    "PUT".to_owned(),
+                    format!(
+                        "/_matrix/client/v3/sendToDevice/{}/{}",
+                        request.event_type, request.txn_id
+                    ),
+                    json!({"messages": request.messages}),
+                ),
+                AnyOutgoingRequest::RoomMessage(request) => (
+                    PendingKind::RoomMessage,
+                    "PUT".to_owned(),
+                    format!(
+                        "/_matrix/client/v3/rooms/{}/send/{}/{}",
+                        request.room_id,
+                        request.content.event_type(),
+                        request.txn_id
+                    ),
+                    serde_json::to_value(request.content.as_ref())
+                        .context("serializing message content")
+                        .map_err(crypto_error)?,
+                ),
+            };
+            self.pending.insert(request_id.clone(), kind);
+            serialized.push(json!({
+                "id": request_id,
+                "method": method,
+                "path": path,
+                "body": body,
+            }));
+        }
+        Ok(json!({"requests": serialized}))
+    }
+
+    async fn mark_request_as_sent(&mut self, params: Value) -> CommandResult {
+        let machine = self.machine()?;
+        let request_id = param_str(&params, "request_id")?.to_owned();
+        let response = params.get("response").cloned().unwrap_or(json!({}));
+        let txn_id = OwnedTransactionId::from(request_id.clone());
+        let kind = *self
+            .pending
+            .get(&request_id)
+            .ok_or_else(|| AgentError::Crypto(anyhow!("unknown request {request_id}")))?;
+
+        let result = match kind {
+            PendingKind::KeysUpload => {
+                let mut counts: BTreeMap<OneTimeKeyAlgorithm, UInt> = BTreeMap::new();
+                if let Some(map) =
+                    response.get("one_time_key_counts").and_then(Value::as_object)
+                {
+                    for (key, value) in map {
+                        let algorithm = serde_json::from_str::<OneTimeKeyAlgorithm>(key).ok();
+                        let count = value.as_u64().and_then(|count| UInt::try_from(count).ok());
+                        if let (Some(algorithm), Some(count)) = (algorithm, count) {
+                            counts.insert(algorithm, count);
+                        }
+                    }
+                }
+                let typed = client_api::keys::upload_keys::v3::Response::new(counts);
+                machine.mark_request_as_sent(&txn_id, &typed).await
+            }
+            PendingKind::KeysQuery => {
+                let mut typed = client_api::keys::get_keys::v3::Response::new();
+                if let Some(device_keys) = response.get("device_keys") {
+                    typed.device_keys = serde_json::from_value(device_keys.clone())
+                        .context("deserializing device_keys")
+                        .map_err(crypto_error)?;
+                }
+                if let Some(failures) = response.get("failures") {
+                    typed.failures = serde_json::from_value(failures.clone())
+                        .context("deserializing failures")
+                        .map_err(crypto_error)?;
+                }
+                machine.mark_request_as_sent(&txn_id, &typed).await
+            }
+            PendingKind::KeysClaim => {
+                let one_time_keys = serde_json::from_value(
+                    response.get("one_time_keys").cloned().unwrap_or(json!({})),
+                )
+                .context("deserializing one_time_keys")
+                .map_err(crypto_error)?;
+                let typed = client_api::keys::claim_keys::v3::Response::new(one_time_keys);
+                machine.mark_request_as_sent(&txn_id, &typed).await
+            }
+            PendingKind::ToDevice => {
+                let typed = client_api::to_device::send_event_to_device::v3::Response::new();
+                machine.mark_request_as_sent(&txn_id, &typed).await
+            }
+            PendingKind::SignatureUpload => {
+                let typed = client_api::keys::upload_signatures::v3::Response::new();
+                machine.mark_request_as_sent(&txn_id, &typed).await
+            }
+            PendingKind::RoomMessage => {
+                let event_id: ruma::OwnedEventId = response
+                    .get("event_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("$invalid")
+                    .parse()
+                    .map_err(crypto_error)?;
+                let typed = client_api::message::send_message_event::v3::Response::new(event_id);
+                machine.mark_request_as_sent(&txn_id, &typed).await
+            }
+        };
+        result.map_err(crypto_error)?;
+        self.pending.remove(&request_id);
+        Ok(json!({}))
+    }
+
+    async fn receive_sync_changes(&mut self, params: Value) -> CommandResult {
+        let machine = self.machine()?;
+        let to_device_events: Vec<Raw<AnyToDeviceEvent>> = params
+            .get("to_device_events")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AgentError::Crypto(anyhow!("missing to_device_events")))?
+            .iter()
+            .map(raw_from_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(crypto_error)?;
+        let changed_devices: ruma::api::client::sync::sync_events::DeviceLists =
+            serde_json::from_value(params.get("changed_devices").cloned().unwrap_or(json!({})))
+                .context("parsing changed_devices")
+                .map_err(crypto_error)?;
+        let one_time_keys_count: BTreeMap<OneTimeKeyAlgorithm, UInt> =
+            serde_json::from_value(params.get("one_time_keys_count").cloned().unwrap_or(json!({})))
+                .context("parsing one_time_keys_count")
+                .map_err(crypto_error)?;
+        let unused_fallback_keys: Option<Vec<OneTimeKeyAlgorithm>> = serde_json::from_value(
+            params
+                .get("unused_fallback_keys")
+                .cloned()
+                .unwrap_or(Value::Null),
+        )
+        .context("parsing unused_fallback_keys")
+        .map_err(crypto_error)?;
+        let next_batch_token: Option<String> = params
+            .get("next_batch_token")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+
+        let changes = EncryptionSyncChanges {
+            to_device_events,
+            changed_devices: &changed_devices,
+            one_time_keys_counts: &one_time_keys_count,
+            unused_fallback_keys: unused_fallback_keys.as_deref(),
+            next_batch_token,
+        };
+        let settings = DecryptionSettings {
+            sender_device_trust_requirement: TrustRequirement::Untrusted,
+        };
+        let (processed, _room_key_infos) = machine
+            .receive_sync_changes(changes, &settings)
+            .await
+            .map_err(crypto_error)?;
+        let events = processed
+            .iter()
+            .map(|event| match event {
+                ProcessedToDeviceEvent::Decrypted { raw, .. } => serde_json::to_value(raw),
+                ProcessedToDeviceEvent::PlainText(raw)
+                | ProcessedToDeviceEvent::Invalid(raw) => serde_json::to_value(raw),
+                ProcessedToDeviceEvent::UnableToDecrypt { encrypted_event, .. } => {
+                    serde_json::to_value(encrypted_event)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .context("serializing processed events")
+            .map_err(crypto_error)?;
+        let outgoing = self.outgoing_requests().await?;
+        Ok(json!({
+            "to_device_events": events,
+            "outgoing_requests": outgoing["requests"],
+        }))
+    }
+
+    async fn decrypt_room_event(&mut self, params: Value) -> CommandResult {
+        let machine = self.machine()?;
+        let room_id = param_str(&params, "room_id")?
+            .parse::<ruma::OwnedRoomId>()
+            .map_err(crypto_error)?;
+        let event: Value = params
+            .get("event")
+            .cloned()
+            .ok_or_else(|| AgentError::Crypto(anyhow!("missing event")))?;
+        let event: Raw<EncryptedEvent> = raw_from_value(&event).map_err(crypto_error)?;
+        let settings = DecryptionSettings {
+            sender_device_trust_requirement: TrustRequirement::Untrusted,
+        };
+        let decrypted = machine
+            .decrypt_room_event(&event, &room_id, &settings)
+            .await
+            .map_err(crypto_error)?;
+        let event = serde_json::to_value(&decrypted.event)
+            .context("serializing decrypted event")
+            .map_err(crypto_error)?;
+        Ok(json!({"event": event}))
+    }
+
+    async fn update_tracked_users(&mut self, params: Value) -> CommandResult {
+        let machine = self.machine()?;
+        let users: Vec<OwnedUserId> = params
+            .get("users")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AgentError::Crypto(anyhow!("missing users")))?
+            .iter()
+            .map(|user| {
+                user.as_str()
+                    .ok_or_else(|| AgentError::Crypto(anyhow!("invalid user")))?
+                    .parse::<OwnedUserId>()
+                    .map_err(crypto_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        machine
+            .update_tracked_users(users.iter().map(|user| user.as_ref()))
+            .await
+            .map_err(crypto_error)?;
+        Ok(json!({}))
+    }
+}
+
+fn crypto_error<E: std::fmt::Display>(error: E) -> AgentError {
+    AgentError::Crypto(anyhow!("{error}"))
+}
+
+fn param_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, AgentError> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| AgentError::Crypto(anyhow!("missing or invalid param {key:?}")))
+}
+
+fn raw_from_value<T>(value: &Value) -> Result<Raw<T>, anyhow::Error>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let raw_value = serde_json::value::RawValue::from_string(serde_json::to_string(value)?)?;
+    Ok(Raw::from_json(raw_value))
+}
+
+

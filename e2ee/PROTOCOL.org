@@ -1,0 +1,171 @@
+#+TITLE: Leman E2EE Agent Protocol
+
+The protocol between Leman.el (the client) and the ~leman-agent~
+subprocess (the agent), which wraps the ~matrix-sdk-crypto~ state
+machine.  Protocol version 1.
+
+* Framing
+
++ One JSON object per line, UTF-8, over the agent's stdin/stdout.
++ Requests (client -> agent): ~{"id": N, "cmd": "...", "params": ...}~.
++ Responses (agent -> client), in request order:
+
+  #+begin_src json
+  {"id": N, "ok": ...}
+  {"id": N, "err": {"code": "...", "message": "..."}}
+  #+end_src
+
++ Malformed lines get ~{"err": {"code": "parse", ...}}~ (no ~id~).
++ Non-object JSON is a framing error, even if valid JSON.
++ Empty lines are ignored.  ~{"cmd": "quit"}~ gets
+  ~{"ok": {"bye": true}}~ and the agent exits.
++ The agent is single-threaded: requests are handled in order and
+  responses are correlated by ~id~.
+
+* Error codes
+
+| ~parse~           | Line is not a JSON object.                            |
+| ~unknown_command~ | Unknown ~cmd~.                                        |
+| ~not_initialized~ | Command requires ~initialize~ first.                  |
+| ~crypto~          | Any crypto/store/parameter failure; ~message~ details. |
+
+* Commands
+
+** ~hello~
+
+#+begin_src json
+{"id": 1, "cmd": "hello"}
+{"id": 1, "ok": {"protocol_version": 1}}
+#+end_src
+
+** ~initialize~
+
+Creates or reopens the OlmMachine for the user's device, backed by a
+SQLite crypto store.  The store directory is created if missing.  The
+agent holds exactly one machine.
+
+#+begin_src json
+{"id": 2, "cmd": "initialize", "params": {
+  "user_id": "@bob:example.org", "device_id": "BOBDEVICE",
+  "store_path": "~/.local/share/leman/crypto/"}}
+{"id": 2, "ok": {"user_id": "...", "device_id": "...",
+                 "identity_keys": {"curve25519": "<base64>", "ed25519": "<base64>"}}}
+#+end_src
+
+** ~outgoing_requests~
+
+Returns the HTTP requests the state machine wants performed, as
+~{method, path, body}~ triples.  The client performs them with its own
+authentication and reports the result with ~mark_request_as_sent~.
+Requests may be re-returned if not yet marked as sent.
+
+#+begin_src json
+{"id": 3, "cmd": "outgoing_requests"}
+{"id": 3, "ok": {"requests": [
+  {"id": "<request-id>", "method": "POST",
+   "path": "/_matrix/client/v3/keys/upload", "body": {...}},
+  {"id": "<request-id>", "method": "PUT",
+   "path": "/_matrix/client/v3/sendToDevice/m.room.encrypted/<txn>", "body": {...}}]}}
+#+end_src
+
+** ~mark_request_as_sent~
+
+The ~request_id~ must match a previously returned request; the agent
+remembers which kind it was.  ~response~ is the homeserver's JSON
+response body for that request.
+
+#+begin_src json
+{"id": 4, "cmd": "mark_request_as_sent", "params": {
+  "request_id": "<request-id>",
+  "response": {"one_time_key_counts": {"signed_curve25519": 100}}}}
+{"id": 4, "ok": {}}
+#+end_src
+
+** ~receive_sync_changes~
+
+Feeds the E2EE parts of a ~/sync~ response into the machine.  Returns
+the to-device events with encrypted ones decrypted, plus any new
+outgoing requests.
+
+/Ordering requirement: this must be called before the client persists
+the ~next_batch~ token of the sync response, or to-device events (room
+keys) can be lost./
+
+/Zeroized keys: room keys (~m.room_key~) are returned with an empty
+~session_key~: key material never leaves the machine (it is kept in
+the store and used internally for decryption).  Clients must not rely
+on the key material being present in returned events./
+
+#+begin_src json
+{"id": 5, "cmd": "receive_sync_changes", "params": {
+  "to_device_events": [{"sender": "...", "type": "m.room.encrypted", "content": {...}}],
+  "changed_devices": {"changed": [], "left": []},
+  "one_time_keys_count": {"signed_curve25519": 100},
+  "unused_fallback_keys": [],
+  "next_batch_token": "s42"}}
+{"id": 5, "ok": {"to_device_events": [<decrypted/processed events>],
+                 "outgoing_requests": [...]}}
+#+end_src
+
+** ~decrypt_room_event~
+
+Decrypts a ~m.room.encrypted~ room event (Megolm).  ~event~ is the
+full event JSON (~sender~, ~event_id~, ~origin_server_ts~, ~type~,
+~room_id~, ~content~).  On success the inner event is returned.
+
+#+begin_src json
+{"id": 6, "cmd": "decrypt_room_event", "params": {
+  "room_id": "!room:example.org",
+  "event": {"sender": "...", "event_id": "...", "type": "m.room.encrypted",
+            "origin_server_ts": 0, "room_id": "...", "content": {...}}}}
+{"id": 6, "ok": {"event": {"type": "m.room.message", "content": {...}, ...}}}
+#+end_src
+
+Failure (~session_not_found~ et al.) comes back as ~{"err": ...}~;
+the client should keep the encrypted event and retry when keys arrive
+(e.g. after ~receive_sync_changes~).
+
+** ~update_tracked_users~
+
+Marks users as tracked (their device lists will be followed; needed
+before encryption).
+
+#+begin_src json
+{"id": 7, "cmd": "update_tracked_users", "params": {"users": ["@alice:example.org"]}}
+{"id": 7, "ok": {}}
+#+end_src
+
+** ~quit~
+
+#+begin_src json
+{"id": 99, "cmd": "quit"}
+{"id": 99, "ok": {"bye": true}}
+#+end_src
+
+* Sync flow (client side)
+
+1. ~outgoing_requests~ -> perform each -> ~mark_request_as_sent~.
+2. ~/sync~.
+3. ~receive_sync_changes~ with the sync's E2EE parts.
+4. ~outgoing_requests~ -> perform -> ~mark_request_as_sent~.
+5. Decrypt room events via ~decrypt_room_event~; render room keys and
+   membership updates via ~update_tracked_users~ and state events.
+6. Persist ~next_batch~ only after step 3 completed.
+
+* Security notes
+
++ The crypto store on disk is unencrypted (same trade-off as
+  Pantalaimon); it must live in a user-private directory (0700).
++ The agent holds the account pickle in memory; clients should not
+  expose the agent's stdio.
++ Key import/export (passphrase-encrypted) and verification arrive
+  with phases E2/E3; until then, devices are trust-on-first-use at
+  the UI level.
+
+* Planned (E2+)
+
++ ~encrypt_room_event~: encrypt outgoing content with Megolm,
+  incl. ~share_room_key~/~get_missing_sessions~ handled internally.
++ ~export_keys~/~import_keys~: room key export files.
++ Verification commands (emoji/QR SAS via MSC4108).
++ Key backup commands (SSSS).
