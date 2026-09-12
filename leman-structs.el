@@ -61,7 +61,9 @@
   device-id initial-device-display-name has-synced-p
   account-data
   ;; Hash table of all seen events, keyed on event ID.
-  events)
+  events
+  ;; E2EE agent (a `leman-e2ee' struct), or nil.
+  e2ee)
 
 (cl-defstruct leman-room
   id display-name prev-batch

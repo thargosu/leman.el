@@ -340,14 +340,23 @@ impl Agent {
             .map(raw_from_value)
             .collect::<Result<Vec<_>, _>>()
             .map_err(crypto_error)?;
+        // NOTE: Clients may omit these sync fields (or send null;
+        // elisp has no empty-object representation), so treat null
+        // as absent.
         let changed_devices: ruma::api::client::sync::sync_events::DeviceLists =
-            serde_json::from_value(params.get("changed_devices").cloned().unwrap_or(json!({})))
-                .context("parsing changed_devices")
-                .map_err(crypto_error)?;
+            match params.get("changed_devices") {
+                Some(Value::Null) | None => Default::default(),
+                Some(value) => serde_json::from_value(value.clone())
+                    .context("parsing changed_devices")
+                    .map_err(crypto_error)?,
+            };
         let one_time_keys_count: BTreeMap<OneTimeKeyAlgorithm, UInt> =
-            serde_json::from_value(params.get("one_time_keys_count").cloned().unwrap_or(json!({})))
-                .context("parsing one_time_keys_count")
-                .map_err(crypto_error)?;
+            match params.get("one_time_keys_count") {
+                Some(Value::Null) | None => Default::default(),
+                Some(value) => serde_json::from_value(value.clone())
+                    .context("parsing one_time_keys_count")
+                    .map_err(crypto_error)?,
+            };
         let unused_fallback_keys: Option<Vec<OneTimeKeyAlgorithm>> = serde_json::from_value(
             params
                 .get("unused_fallback_keys")

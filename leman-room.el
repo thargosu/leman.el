@@ -122,6 +122,7 @@ Used to, e.g. call `leman-room-compose-org'.")
 (declare-function leman-notify-switch-to-notifications-buffer "leman-notify")
 (declare-function leman--update-unread-indicator "leman.el")
 (declare-function leman--make-event "leman.el")
+(declare-function leman-e2ee--decrypt-event "leman.el")
 
 (defvar leman-room-mode-self-insert-keymap (make-sparse-keymap)
   "The `leman-room-mode' keymap under `leman-room-self-insert-mode'.
@@ -2596,8 +2597,10 @@ already known to SESSION, and return the new events as a list."
            do (if (gethash (alist-get 'event_id event) (leman-session-events session))
                   ;; Duplicate event: set to nil to be ignored.
                   (setf event nil)
-                ;; New event.
-                (setf event (leman--make-event event))
+                ;; New event.  Decrypt E2EE events, if possible (the
+                ;; /messages endpoint's events include the room ID).
+                (setf event (leman-e2ee--decrypt-event session event)
+                      event (leman--make-event event))
                 ;; HACK: Put events on events table.  See FIXME in caller about using the event hook.
                 (leman--put-event event nil session))
            (leman-progress-update)

@@ -55,6 +55,7 @@
 
 ;; This package.
 (require 'leman-lib)
+(require 'leman-e2ee)
 (require 'leman-room)
 (require 'leman-notifications)
 (require 'leman-notify)
@@ -319,6 +320,7 @@ user is prompted."
   (setf (alist-get (leman-user-id (leman-session-user session))
                    leman-sessions nil nil #'equal)
         session)
+  (leman-e2ee--start-agent session)
   (leman--sync session :timeout leman-initial-sync-timeout))
 
 (defun leman--connect-args ()
@@ -383,6 +385,8 @@ in them won't work."
     ;; Write sessions before we remove them from the variable.
     (leman--write-sessions leman-sessions))
   (dolist (session sessions)
+    (when-let ((agent (leman-session-e2ee session)))
+      (leman-e2ee-stop agent))
     (let ((user-id (leman-user-id (leman-session-user session))))
       (when-let ((process (map-elt leman-syncs session)))
         ;; Disable the sync process's ELSE handler, preventing error messages, but still
@@ -418,7 +422,82 @@ Useful in, e.g. `leman-disconnect-hook', which see."
           (leman-session-device-id session) device-id)
     (leman--session-start-sync session)))
 
-;;;; Functions
+;;;;; E2EE integration
+
+(defun leman-e2ee--start-agent (session)
+  "Start an E2EE agent for SESSION, if not already running.
+If the agent program is unavailable, disable E2EE for SESSION
+with a message."
+  (unless (leman-session-e2ee session)
+    (let ((user-id (leman-user-id (leman-session-user session)))
+          (device-id (leman-session-device-id session)))
+      (if (and user-id device-id)
+          (condition-case err
+              (setf (leman-session-e2ee session)
+                    (leman-e2ee-start user-id device-id))
+            (error (leman-message "Leman E2EE unavailable: %s" (error-message-string err))))
+        (leman-message "Leman E2EE disabled: device ID unknown.")))))
+
+(defun leman-e2ee--decrypt-event (session event &optional room-id)
+  "Decrypt EVENT (from ROOM-ID) with SESSION's E2EE agent.
+If EVENT is not encrypted, the agent is unavailable, or
+decryption fails, return EVENT unchanged."
+  (let ((agent (leman-session-e2ee session)))
+    (if (and agent (equal (alist-get 'type event) "m.room.encrypted"))
+        ;; Sync room events don't include the room ID; the agent needs it.
+        (leman-e2ee-decrypt-event agent
+                                   (if room-id
+                                       (cons (cons 'room_id room-id) event)
+                                     event))
+      event)))
+
+(defun leman-e2ee--sync-changes (session data)
+  "Send the E2EE parts of the sync DATA to SESSION's agent.
+This must be called before the sync's next-batch token is
+persisted (to-device events are ephemeral; persisting the token
+first could lose room keys).  Afterwards, the agent's outgoing
+requests are performed."
+  (when-let ((agent (leman-session-e2ee session)))
+    (condition-case err
+        (leman-e2ee-receive-sync-changes
+         agent
+         (alist-get 'events (alist-get 'to_device data))
+         (or (alist-get 'device_lists data) (list))
+         (or (alist-get 'device_one_time_keys_count data) (list))
+         (alist-get 'device_unused_fallback_key_types data)
+         (alist-get 'next_batch data))
+      (leman-e2ee-error
+       (leman-message "Leman E2EE: processing sync changes failed: %S" (cdr err))))
+    (leman-e2ee--process-outgoing-requests session)))
+
+(defun leman-e2ee--process-outgoing-requests (session)
+  "Perform the E2EE agent's outgoing requests for SESSION."
+  (when-let* ((agent (leman-session-e2ee session))
+              (requests (leman-e2ee-outgoing-requests agent)))
+    (cl-loop for request across requests
+             do (leman-e2ee--perform-outgoing-request session agent request))))
+
+(defun leman-e2ee--perform-outgoing-request (session agent request)
+  "Perform the agent's outgoing REQUEST on SESSION's homeserver.
+When it succeeds, report the response to the agent."
+  (pcase-let* (((map ('id id) ('method method) ('path path) ('body body)) request)
+               (`(,version ,endpoint) (leman-e2ee--split-path path))
+               (method (intern (downcase method))))
+    (leman-api session endpoint
+               :method method
+               :version version
+               :data (json-encode body)
+               :then (lambda (data)
+                       (condition-case err
+                           (leman-e2ee-mark-request-as-sent agent id data)
+                         (leman-e2ee-error
+                          (leman-message "Leman E2EE: marking request as sent failed: %S"
+                                         (cdr err)))))
+               :else (lambda (plz-error)
+                       (leman-message "Leman E2EE: request %s failed: %S"
+                                      endpoint plz-error)))))
+
+;;; Functions
 
 (defun leman-interrupted-sync-warning (session)
   "Display a warning that syncing of SESSION was interrupted."
@@ -622,6 +701,10 @@ Runs `leman-sync-callback-hook' with SESSION."
   ;; Remove the sync first.  We already have the data from it, and the
   ;; process has exited, so it's safe to run another one.
   (setf (map-elt leman-syncs session) nil)
+  ;; Send the sync's E2EE parts to the agent (this must happen before
+  ;; the next-batch token is persisted, or to-device events like room
+  ;; keys can be lost), then perform its outgoing requests.
+  (leman-e2ee--sync-changes session data)
   (pcase-let* (((map rooms ('next_batch next-batch) ('account_data (map ('events account-data-events))))
                 data)
                ((map ('join joined-rooms) ('invite invited-rooms) ('leave left-rooms)) rooms)
@@ -783,7 +866,8 @@ Also used for left rooms, in which case STATUS should be set to
                     ;; origin-server-ts pushed.
                     `(let ((ts 0) (event-structs nil))
                        (cl-loop for event across-ref (alist-get 'events ,type)
-                                do (setf event (leman--make-event event))
+                                do (setf event (leman-e2ee--decrypt-event session event id)
+                                          event (leman--make-event event))
                                 (push event event-structs)
                                 (push event (,accessor room))
                                 (when (leman--sync-messages-p session)

@@ -13,6 +13,11 @@
 
 (require 'leman-e2ee)
 
+(declare-function leman--push-joined-room-events "leman")
+(declare-function leman-e2ee--decrypt-event "leman")
+(declare-function leman-e2ee--perform-outgoing-request "leman")
+(declare-function leman-e2ee--sync-changes "leman")
+
 ;;;; Helpers
 
 (defconst leman-e2ee-tests--root
@@ -29,14 +34,32 @@
                   (expand-file-name "e2ee/agent/target/release/leman-agent" leman-e2ee-tests--root))))
 
 (defun leman-e2ee-tests--fake-agent (responses)
-  "Return an agent whose fake transport sends RESPONSES.
-RESPONSES is a list of lines delivered in response to any
-request; nil responds nothing."
-  (leman-e2ee--create
-   :pending (make-hash-table :test #'eql)
-   :fake (lambda (agent _line)
-           (dolist (response responses)
-             (leman-e2ee-handle-line agent response)))))
+  "Return (AGENT . SENT-LINES) for a fake agent.
+RESPONSES maps command symbols to OK values; unmatched commands
+get an empty OK object, and a value of the form (err CODE
+MESSAGE) produces an error response.  Request ids are echoed; the
+lines sent to the agent are collected (newest first) in
+SENT-LINES."
+  (let ((sent-lines (list nil)))
+    (cons (leman-e2ee--create
+           :pending (make-hash-table :test #'eql)
+           :fake (lambda (agent line)
+                   (setcdr sent-lines (cons line (cdr sent-lines)))
+                   (let* ((request (leman-e2ee--decode line))
+                          (id (alist-get 'id request))
+                          (cmd (alist-get 'cmd request))
+                          (value (and (stringp cmd)
+                                      (alist-get (intern cmd) responses)))
+                          (body (pcase value
+                                  ((pred (lambda (v) (and (consp v) (eq (car v) 'err))))
+                                   (let ((code (nth 1 value))
+                                         (message (nth 2 value)))
+                                     (list (cons 'err (list (cons 'code code)
+                                                            (cons 'message message))))))
+                                  (_ (list (cons 'ok (or value (list))))))))
+                     (leman-e2ee-handle-line
+                      agent (json-encode (cons (cons 'id id) body))))))
+          sent-lines)))
 
 ;;;; Encoding/decoding
 
@@ -61,7 +84,11 @@ request; nil responds nothing."
                    '(ok . ((x . 2)))))
     (leman-e2ee-handle-line agent "{\"id\":2,\"err\":{\"code\":\"parse\",\"message\":\"nope\"}}")
     (should (equal (gethash 2 (leman-e2ee-pending agent))
-                   '(err . ((code . "parse") (message . "nope")))))))
+                   '(err . ((code . "parse") (message . "nope")))))
+    ;; An empty "ok" object must be a success, not an error.
+    (leman-e2ee-handle-line agent "{\"id\":3,\"ok\":{}}")
+    (should (equal (gethash 3 (leman-e2ee-pending agent))
+                   '(ok)))))
 
 (ert-deftest leman-e2ee-handle-line-ignores-stray-and-garbage ()
   (let ((agent (leman-e2ee--create :pending (make-hash-table :test #'eql))))
@@ -73,21 +100,31 @@ request; nil responds nothing."
 
 (ert-deftest leman-e2ee-request-correlates-by-id ()
   ;; A stray response with a different id must not satisfy the request.
-  (let* ((agent (leman-e2ee-tests--fake-agent
-                 '("{\"id\":99,\"ok\":{\"stray\":true}}"
-                   "{\"id\":1,\"ok\":{\"value\":42}}"))))
-    (should (equal (alist-get 'value (leman-e2ee-request agent "hello"))
+  (let* ((agent (leman-e2ee-tests--fake-agent nil))
+         ;; Send two responses by hand, the correct one last.
+         (sent-lines (cdr agent)))
+    ;; The transport must stay silent: otherwise it would answer the
+    ;; request (and clobber the preloaded id) as soon as it is sent.
+    (setf (leman-e2ee-fake (car agent)) (lambda (_agent _line) nil))
+    (setcdr sent-lines (list "{\"id\":99,\"ok\":{\"stray\":true}}"
+                             "{\"id\":1,\"ok\":{\"value\":42}}"))
+    (dolist (line (cdr sent-lines))
+      (leman-e2ee-handle-line (car agent) line))
+    (should (equal (alist-get 'value (leman-e2ee-request (car agent) "hello"))
                    42))))
 
 (ert-deftest leman-e2ee-request-signals-error ()
-  (let ((agent (leman-e2ee-tests--fake-agent
-                '("{\"id\":1,\"err\":{\"code\":\"crypto\",\"message\":\"boom\"}}"))))
-    (should-error (leman-e2ee-request agent "decrypt_room_event")
+  (let ((agent (car (leman-e2ee-tests--fake-agent
+                     (list (cons 'hello '(err "crypto" "boom")))))))
+    (should-error (leman-e2ee-request agent "hello")
                   :type 'leman-e2ee-error)))
 
 (ert-deftest leman-e2ee-request-times-out ()
   (let ((leman-e2ee-request-timeout 0.1)
-        (agent (leman-e2ee-tests--fake-agent nil)))
+        (agent (car (leman-e2ee-tests--fake-agent nil))))
+    ;; The fake responds to every command; stub out its transport so
+    ;; nothing is answered.
+    (setf (leman-e2ee-fake agent) (lambda (_agent _line) nil))
     (should-error (leman-e2ee-request agent "hello")
                   :type 'leman-e2ee-error)))
 
@@ -139,6 +176,140 @@ request; nil responds nothing."
                                      (alist-get 'path request)))
             (should (alist-get 'body request))))
       (leman-e2ee-stop agent))))
+
+;;;; Decrypting events
+
+(ert-deftest leman-e2ee-decrypt-event ()
+  (let* ((decrypted-event (list (cons 'type "m.room.message")
+                                (cons 'content (list (cons 'body "decrypted!")))))
+         (fake (leman-e2ee-tests--fake-agent
+                (list (cons 'decrypt_room_event (list (cons 'event decrypted-event))))))
+         (event (list (cons 'type "m.room.encrypted")
+                      (cons 'room_id "!room:x.org")
+                      (cons 'content (list (cons 'algorithm "m.megolm.v1.aes-sha2"))))))
+    (should (equal (leman-e2ee-decrypt-event (car fake) event)
+                   decrypted-event))))
+
+(ert-deftest leman-e2ee-decrypt-event-failure-returns-original ()
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'decrypt_room_event '(err "crypto" "session not found")))))
+         (event (list (cons 'type "m.room.encrypted")
+                      (cons 'room_id "!room:x.org")
+                      (cons 'content (list (cons 'algorithm "m.megolm.v1.aes-sha2"))))))
+    (should (equal (leman-e2ee-decrypt-event (car fake) event)
+                   event))))
+
+(ert-deftest leman-e2ee-decrypt-event-ignores-plaintext ()
+  (let* ((fake (leman-e2ee-tests--fake-agent nil))
+         (event (list (cons 'type "m.room.message")
+                      (cons 'content (list (cons 'body "hi"))))))
+    (should (equal (leman-e2ee-decrypt-event (car fake) event) event))))
+
+;;;; Integration with the sync flow
+
+(ert-deftest leman-e2ee-split-path ()
+  (should (equal (leman-e2ee--split-path "/_matrix/client/v3/keys/upload")
+                 (list "v3" "keys/upload")))
+  (should (equal (leman-e2ee--split-path
+                  "/_matrix/client/v3/sendToDevice/m.room.encrypted/txn1")
+                 (list "v3" "sendToDevice/m.room.encrypted/txn1")))
+  (should-error (leman-e2ee--split-path "https://example.org/whatever")))
+
+(ert-deftest leman-e2ee-session-decrypt-event ()
+  ;; With an agent: encrypted events are decrypted (and get a room ID
+  ;; injected when the caller knows it); without one: unchanged.
+  (let* ((decrypted-event (list (cons 'type "m.room.message")
+                                (cons 'content (list (cons 'body "shh")))))
+         (fake (leman-e2ee-tests--fake-agent
+                (list (cons 'decrypt_room_event (list (cons 'event decrypted-event))))))
+         (session (make-leman-session))
+         (event (list (cons 'type "m.room.encrypted")
+                      (cons 'content (list (cons 'algorithm "m.megolm.v1.aes-sha2"))))))
+    (setf (leman-session-e2ee session) (car fake))
+    (let ((result (leman-e2ee--decrypt-event session event "!room:x.org")))
+      (should (equal (alist-get 'body (alist-get 'content result)) "shh")))
+    ;; Without an agent the event is returned unchanged.
+    (setf (leman-session-e2ee session) nil)
+    (should (equal (leman-e2ee--decrypt-event session event "!room:x.org")
+                   event))))
+
+(ert-deftest leman-e2ee-sync-changes-sends-to-agent ()
+  (let* ((fake (leman-e2ee-tests--fake-agent nil))
+         (session (make-leman-session))
+         (to-device-event (list (cons 'type "m.room.encrypted")
+                                (cons 'sender "@a:x.org")))
+         (data (list (cons 'next_batch "s42")
+                     (cons 'to_device (list (cons 'events (vector to-device-event))))
+                     (cons 'device_lists (list (cons 'changed (vector "@a:x.org"))
+                                               (cons 'left (vector))))
+                     (cons 'device_one_time_keys_count
+                           (list (cons 'signed_curve25519 100))))))
+    (setf (leman-session-e2ee session) (car fake))
+    (leman-e2ee--sync-changes session data)
+    (let* ((lines (cdr fake))
+           (request (seq-find
+                     (lambda (line)
+                       (equal (alist-get 'cmd (leman-e2ee--decode line))
+                              "receive_sync_changes"))
+                     lines)))
+      (should request)
+      (let ((params (alist-get 'params (leman-e2ee--decode request))))
+        (should (equal (alist-get 'next_batch_token params) "s42"))
+        (should (equal (alist-get 'type (elt (alist-get 'to_device_events params) 0))
+                       "m.room.encrypted"))
+        (should (equal (elt (alist-get 'changed (alist-get 'changed_devices params)) 0)
+                       "@a:x.org"))
+        (should (equal (alist-get 'signed_curve25519
+                                  (alist-get 'one_time_keys_count params))
+                       100))))))
+(ert-deftest leman-e2ee-sync-changes-pumps-outgoing-requests ()
+  (let* ((fake (leman-e2ee-tests--fake-agent
+                (list (cons 'outgoing_requests
+                            (list (cons 'requests (vector
+                                                   (list (cons 'id "req1")
+                                                         (cons 'method "POST")
+                                                         (cons 'path "/_matrix/client/v3/keys/upload")
+                                                         (cons 'body (list (cons 'device_keys (list))))))))))))
+         (session (make-leman-session))
+         (performed nil))
+    (setf (leman-session-e2ee session) (car fake))
+    ;; Stub the HTTP layer: `leman-api' would perform a real request.
+    (cl-letf (((symbol-function #'leman-e2ee--perform-outgoing-request)
+               (lambda (_session _agent request)
+                 (push request performed))))
+      (leman-e2ee--sync-changes session (list (cons 'next_batch "s1"))))
+    (should (equal (alist-get 'path (car performed))
+                   "/_matrix/client/v3/keys/upload"))
+    (should (equal (alist-get 'id (car performed)) "req1"))))
+
+(ert-deftest leman-e2ee-push-room-events-decrypts ()
+  ;; Full push-path integration: an encrypted timeline event is
+  ;; decrypted before being turned into an event struct.
+  (let* ((decrypted-event (list (cons 'type "m.room.message")
+                                (cons 'sender "@alice:x.org")
+                                (cons 'origin_server_ts 42)
+                                (cons 'content (list (cons 'body "It's a secret")
+                                                     (cons 'msgtype "m.text")))))
+         (fake (leman-e2ee-tests--fake-agent
+                (list (cons 'decrypt_room_event (list (cons 'event decrypted-event))))))
+         (session (make-leman-session))
+         (encrypted-event (list (cons 'type "m.room.encrypted")
+                                (cons 'sender "@alice:x.org")
+                                (cons 'origin_server_ts 42)
+                                (cons 'event_id "$enc1")
+                                (cons 'content (list (cons 'algorithm "m.megolm.v1.aes-sha2"))))))
+    (setf (leman-session-e2ee session) (car fake))
+    (setf (leman-session-events session) (make-hash-table :test #'equal))
+    (leman--push-joined-room-events
+     session
+     (cons (intern "!room:x.org")
+           (list (cons 'timeline (list (cons 'events (vector encrypted-event)))))))
+    (let ((room (car (leman-session-rooms session)))
+          (event (car (leman-room-timeline (car (leman-session-rooms session))))))
+      (should (equal (leman-room-id room) "!room:x.org"))
+      (should (equal (leman-event-type event) "m.room.message"))
+      (should (equal (alist-get 'body (leman-event-content event))
+                     "It's a secret")))))
 
 ;;;; Footer
 

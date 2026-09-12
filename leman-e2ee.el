@@ -145,10 +145,15 @@ table; responses without a recognized id are logged."
      ((null response)
       (leman-e2ee--log agent (format "unparseable response: %s" line)))
      ((alist-get 'id response)
+      ;; Use key presence (assq), not value truthiness: an empty "ok"
+      ;; object ("ok":{}) decodes to a nil value but is still a
+      ;; success, and elisp cannot distinguish {} from null.
       (puthash (alist-get 'id response)
-               (if (alist-get 'ok response)
-                   (cons 'ok (alist-get 'ok response))
-                 (cons 'err (alist-get 'err response)))
+               (cond ((assq 'ok response)
+                      (cons 'ok (alist-get 'ok response)))
+                     ((assq 'err response)
+                      (cons 'err (alist-get 'err response)))
+                     (t (cons 'err nil)))
                (leman-e2ee-pending agent)))
      (t (leman-e2ee--log agent (format "stray response: %s" line))))))
 
@@ -210,6 +215,35 @@ or does not respond within TIMEOUT seconds
      (t (signal 'leman-e2ee-error
                 (list "timeout" (format "no response to %S within %s seconds"
                                         command (or timeout leman-e2ee-request-timeout))))))))
+
+;;;; Decrypting events
+
+(defun leman-e2ee-decrypt-event (agent event)
+  "Decrypt EVENT (a m.room.encrypted event alist) with AGENT.
+EVENT must have a `room_id' key (events from sync responses
+don't; callers must add it).  Return the decrypted event alist,
+or EVENT unchanged if it isn't encrypted or decryption fails
+(e.g. the room key hasn't arrived yet; the caller should keep the
+encrypted event and retry when keys arrive)."
+  (if (and agent (equal (alist-get 'type event) "m.room.encrypted"))
+      (condition-case err
+          (leman-e2ee-decrypt-room-event agent (alist-get 'room_id event) event)
+        (leman-e2ee-error
+         (leman-e2ee--log agent (format "decryption failed: %S" (cdr err)))
+         event))
+    event))
+
+(defun leman-e2ee--split-path (path)
+  "Split an agent request PATH into (VERSION ENDPOINT).
+E.g. \"/_matrix/client/v3/keys/upload\" -> (\"v3\" \"keys/upload\")."
+  (let ((segments (split-string path "/")))
+    (unless (and (equal (nth 0 segments) "")
+                 (equal (nth 1 segments) "_matrix")
+                 (equal (nth 2 segments) "client")
+                 (>= (length segments) 4))
+      (signal 'leman-e2ee-error
+              (list "invalid" (format "unexpected request path: %S" path))))
+    (list (nth 3 segments) (string-join (nthcdr 4 segments) "/"))))
 
 ;;;; Lifecycle
 
