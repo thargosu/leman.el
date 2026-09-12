@@ -1,11 +1,7 @@
 ;;; leman.el --- Matrix client                       -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2022-2023  Free Software Foundation, Inc.
-
-;; Author: Adam Porter <adam@alphapapa.net>
-;; Maintainer: Adam Porter <adam@alphapapa.net>
 ;; URL: https://github.com/thargosu/leman.el
-;; Version: 0.18-pre
+;; Version: 0.1
 ;; Package-Requires: ((emacs "30.1") (map "2.1") (persist "0.5") (plz "0.6") (taxy "0.10") (taxy-magit-section "0.13") (svg-lib "0.2.5") (transient "0.3.7"))
 ;; Keywords: comm
 
