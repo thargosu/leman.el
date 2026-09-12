@@ -59,6 +59,11 @@ Build it once:
   cd e2ee/agent && cargo build --release
 #+end_src
 
+Or from inside Emacs with ~M-x leman-e2ee-build-agent~ (requires
+cargo on the ~exec-path~).  If the agent isn't found at connect
+time, a warning is shown; ~M-x leman-e2ee-status~ reports whether an
+agent is running and where the program was looked up.
+
 Current support (phase 1):
 
 + Decryption of encrypted rooms, including history after key receipt

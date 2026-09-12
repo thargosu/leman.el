@@ -247,16 +247,33 @@ E.g. \"/_matrix/client/v3/keys/upload\" -> (\"v3\" \"keys/upload\")."
 
 ;;;; Lifecycle
 
+(defun leman-e2ee--load-dir ()
+  "Return the directory Leman is loaded from."
+  (file-name-directory
+   (or (locate-library "leman.el" t)
+       default-directory)))
+
 (defun leman-e2ee--agent-program ()
   "Return the path to the `leman-agent' executable."
   (or leman-e2ee-agent-program
       (executable-find "leman-agent")
-      (let ((load-dir (file-name-directory
-                       (or (locate-library "leman.el" t)
-                           default-directory))))
+      (let ((load-dir (leman-e2ee--load-dir)))
         (seq-find #'file-executable-p
                   (list (expand-file-name "e2ee/agent/target/release/leman-agent" load-dir)
                         (expand-file-name "e2ee/agent/target/debug/leman-agent" load-dir))))))
+
+(defun leman-e2ee-build-agent ()
+  "Build the E2EE agent program with cargo.
+Uses the agent source directory of the Leman installation.  Note
+that cargo must be found on the `exec-path'."
+  (interactive)
+  (unless (executable-find "cargo")
+    (user-error "Leman E2EE: cargo not found on `exec-path'; install Rust or add ~/.cargo/bin to the `exec-path'"))
+  (let* ((agent-dir (expand-file-name "e2ee/agent" (leman-e2ee--load-dir))))
+    (unless (file-directory-p agent-dir)
+      (user-error "Leman E2EE: agent source not found at %S" agent-dir))
+    (let ((default-directory agent-dir))
+      (compilation-start "cargo build"))))
 
 (defun leman-e2ee--store-path (user-id)
   "Return the crypto store directory for USER-ID, creating it.

@@ -439,9 +439,12 @@ fetched with the whoami API first."
                      (condition-case err
                          (setf (leman-session-e2ee session)
                                (leman-e2ee-start user-id device-id))
-                       (error (leman-message "Leman E2EE unavailable: %s"
-                                             (error-message-string err))))
-                   (leman-message "Leman E2EE disabled: device ID unknown."))))
+                       ;; Use a warning rather than a message: users
+                       ;; miss echo-area messages while connecting.
+                       (error (display-warning 'leman
+                                               (format "Leman E2EE unavailable: %s"
+                                                       (error-message-string err)))))
+                   (display-warning 'leman "Leman E2EE disabled: device ID unknown."))))
               (finish
                ()
                (when then (funcall then))))
@@ -454,7 +457,8 @@ fetched with the whoami API first."
                 (start-agent)
                 (finish))
         :else (lambda (plz-error)
-                (leman-message "Leman E2EE disabled: unable to fetch device ID: %S" plz-error)
+                (display-warning 'leman
+                                 (format "Leman E2EE disabled: unable to fetch device ID: %S" plz-error))
                 (finish))))))
 
 (defun leman-e2ee-status (session)
@@ -462,8 +466,15 @@ fetched with the whoami API first."
   (interactive (list (leman-complete-session)))
   (let ((agent (leman-session-e2ee session)))
     (if (not agent)
-        (message "Leman E2EE: no agent running for %s."
-                 (leman-user-id (leman-session-user session)))
+        (let ((user (leman-user-id (leman-session-user session)))
+              (program (leman-e2ee--agent-program)))
+          (if program
+              (message "Leman E2EE: no agent running for %s (agent found at %s; try reconnecting)."
+                       user program)
+            (message (concat "Leman E2EE: no agent running for %s; agent program not found."
+                             "  Build it with `M-x leman-e2ee-build-agent' or set"
+                             " `leman-e2ee-agent-program', then reconnect.")
+                     user)))
       (message "Leman E2EE: agent %s for %s on device %s (log buffer: %s)"
                (if (process-live-p (leman-e2ee-process agent))
                    "running" "NOT RUNNING")
