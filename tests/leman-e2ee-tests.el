@@ -307,6 +307,27 @@ SENT-LINES."
       (leman-e2ee--process-outgoing-requests session)
       (should (equal (car bodies) body)))))
 
+(ert-deftest leman-push-joined-room-events-dedups-redelivered-events ()
+  ;; An event re-delivered by a later sync (e.g. after a limited
+  ;; timeline, or a second concurrent sync) must not appear twice.
+  ;; NOTE: Each sync response carries fresh event vectors (the push
+  ;; path converts them in place).
+  (let* ((session (make-leman-session))
+         (room-data (lambda ()
+                      (list (cons 'timeline
+                                  (list (cons 'events
+                                              (vector (list (cons 'type "m.room.message")
+                                                            (cons 'sender "@alice:x.org")
+                                                            (cons 'origin_server_ts 42)
+                                                            (cons 'event_id "$dup")
+                    (cons 'content (list (cons 'body "once")
+                                         (cons 'msgtype "m.text"))))))))))))
+    (setf (leman-session-events session) (make-hash-table :test #'equal))
+    (leman--push-joined-room-events session (cons (intern "!room:x.org") (funcall room-data)))
+    (leman--push-joined-room-events session (cons (intern "!room:x.org") (funcall room-data)))
+    (should (= 1 (length (leman-room-timeline
+                          (car (leman-session-rooms session))))))))
+
 (ert-deftest leman-e2ee-push-room-events-decrypts ()
   ;; Full push-path integration: an encrypted timeline event is
   ;; decrypted before being turned into an event struct.

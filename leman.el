@@ -915,12 +915,19 @@ Also used for left rooms, in which case STATUS should be set to
                        (cl-loop for event across-ref (alist-get 'events ,type)
                                 do (setf event (leman-e2ee--decrypt-event session event id)
                                           event (leman--make-event event))
-                                (push event event-structs)
-                                (push event (,accessor room))
-                                (when (leman--sync-messages-p session)
-                                  (leman-progress-update))
-                                (when (> (leman-event-origin-server-ts event) ts)
-                                  (setf ts (leman-event-origin-server-ts event))))
+                                ;; Skip events already known to the session
+                                ;; (e.g. re-delivered after a limited timeline,
+                                ;; or by a second concurrent sync), otherwise
+                                ;; they would be shown twice.
+                                (unless (and (leman-event-id event)
+                                             (gethash (leman-event-id event)
+                                                      (leman-session-events session)))
+                                  (push event event-structs)
+                                  (push event (,accessor room))
+                                  (when (leman--sync-messages-p session)
+                                    (leman-progress-update))
+                                  (when (> (leman-event-origin-server-ts event) ts)
+                                    (setf ts (leman-event-origin-server-ts event)))))
                        ;; One would think that one should use `maximizing' here, but, completely
                        ;; inexplicably, it sometimes returns nil, even when every single value it's comparing
                        ;; is a number.  It's absolutely bizarre, but I have to do the equivalent manually.
