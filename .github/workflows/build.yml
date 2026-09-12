@@ -68,8 +68,14 @@ jobs:
             (dolist (pkg (quote (map persist plz taxy taxy-magit-section svg-lib transient compat dash llama cond-let)))
               (package-install pkg)))'
 
+      # Build the agent so the e2ee-real tests can run against it.
+      - name: Build agent
+        working-directory: e2ee/agent
+        run: cargo build
+
       - name: Run tests
         run: |
           emacs --batch -Q -L . $(ls -d ~/.emacs.d/elpa/*/ | sed 's/^/-L /' | tr '\n' ' ') \
             -l leman-structs.el -l leman-lib.el -l leman-macros.el -l leman-room.el -l leman.el \
-            -l tests/leman-tests.el -f ert-run-tests-batch
+            -l leman-e2ee.el \
+            -l tests/leman-tests.el -l tests/leman-e2ee-tests.el -f ert-run-tests-batch
