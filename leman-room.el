@@ -2938,6 +2938,8 @@ data slot."
           ;; stored order, which is latest-first), because some logic depends on this
           ;; (e.g. processing a message-edit event before the edited event would mean the
           ;; edited event would not yet be in the buffer).
+          (setf (leman-room-state room) (leman-room--sanitize-events (leman-room-state room))
+                (leman-room-timeline room) (leman-room--sanitize-events (leman-room-timeline room)))
           (leman-room--process-events (reverse (leman-room-state room)))
           (leman-room--process-events (reverse (leman-room-timeline room)))
           (leman-room--insert-ts-headers)
@@ -3058,6 +3060,8 @@ arguments."
                                                                   (lambda (data)
                                                                     (eq event-at-point data)))))
                                                  (ewoc-goto-node leman-ewoc node))))))
+      (setf (leman-room-state room) (leman-room--sanitize-events (leman-room-state room))
+            (leman-room-timeline room) (leman-room--sanitize-events (leman-room-timeline room)))
       (leman-room--process-events (reverse (leman-room-state room)))
       (leman-room--process-events (reverse (leman-room-timeline room)))
       (ewoc-filter leman-ewoc pred)
@@ -3117,6 +3121,20 @@ arguments."
 ;; otherwise the events may be inserted at the wrong place.  (I'm not
 ;; sure if this is a bug in EWOC or in my code, but doing this fixes it.)
 
+(defun leman-room--sanitize-events (events)
+  "Return EVENTS with any raw events converted to structs.
+Raw (unconverted) events may end up in rooms' event slots, e.g.
+from sync responses with unexpected formats; nils, e.g. from
+`leman-room--process-retro-chunk'.  Since event slots are
+iterable by many functions which expect structs (e.g.
+`leman--user-displayname-in'), convert or discard such entries."
+  (declare (function leman--make-event "leman.el"))
+  (cl-loop for event in events
+           when event
+           collect (if (leman-event-p event)
+                       event
+                     (leman--make-event event))))
+
 (defun leman-room--process-events (events)
   "Process EVENTS in current buffer.
 Calls `leman-progress-update' for each event.  Calls
@@ -3126,8 +3144,17 @@ buffer."
   ;; FIXME: Calling `leman-room--insert-ts-headers' is convenient, but it
   ;; may also be called in functions that call this function, which may
   ;; result in it being called multiple times for a single set of events.
-  (cl-loop for event being the elements of events ;; EVENTS may be a list or array.
-           for handler = (alist-get (leman-event-type event) leman-room-event-fns nil nil #'equal)
+  (cl-loop for entry being the elements of events ;; EVENTS may be a list or array.
+           ;; NOTE: Raw events may be present (e.g. from unconverted sync
+           ;; responses or, for already-seen events, nils, e.g. from
+           ;; `leman-room--process-retro-chunk'); convert or discard them.
+           for event = (if (leman-event-p entry)
+                           entry
+                         (when-let* ((raw entry)
+                                     ((alist-get 'event_id raw)))
+                           (leman--make-event raw)))
+           for handler = (when event
+                           (alist-get (leman-event-type event) leman-room-event-fns nil nil #'equal))
            when handler
            do (funcall handler event)
            do (leman-progress-update))
@@ -3137,7 +3164,11 @@ buffer."
   "Process EVENT in current buffer.
 Uses handlers defined in `leman-room-event-fns'.  The current
 buffer should be a room's buffer."
-  (when-let ((handler (alist-get (leman-event-type event) leman-room-event-fns nil nil #'equal)))
+  (when (and event (not (leman-event-p event)))
+    ;; Raw event: convert it (see `leman-room--process-events').
+    (setf event (leman--make-event event)))
+  (when-let ((handler (when event
+                        (alist-get (leman-event-type event) leman-room-event-fns nil nil #'equal))))
     ;; We demote any errors that happen while processing events, because it's possible for
     ;; events to be malformed in unexpected ways, and that could cause an error, which
     ;; would stop processing of other events and prevent further syncing.  See,
@@ -3348,7 +3379,11 @@ function to `leman-room-event-fns', which see."
                                  (lambda (data)
                                    (and (leman-event-p data)
                                         (equal root-id (leman-event-id data)))))))
-               (ewoc-invalidate leman-ewoc nodes))))
+               (ewoc-invalidate leman-ewoc nodes))
+             ;; Refresh an open thread view for this thread.
+             (when-let* ((thread-buffer (leman-room--thread-buffer root-id leman-room))
+                         (root-event (gethash root-id (leman-session-events leman-session))))
+               (leman-room--render-thread thread-buffer root-event))))
           ((and leman-room-replace-edited-messages
                 replaces-event-id (equal "m.replace" rel-type))
            ;; Event replaces existing event: find and replace it in buffer if possible, otherwise insert it.
@@ -4252,6 +4287,15 @@ original ID and relationships."
                         (nth pos events) copy))
              and return t)))
 
+(defun leman-room--thread-buffer (root-id room)
+  "Return the open thread buffer for thread rooted at ROOT-ID in ROOM, if any."
+  (cl-find-if (lambda (buffer)
+                (with-current-buffer buffer
+                  (and (derived-mode-p 'leman-thread-mode)
+                       (equal leman-thread-root-id root-id)
+                       (equal leman-room room))))
+              (buffer-list)))
+
 (defun leman-room--thread-summary (event)
   "Return EVENT's server-side thread summary, if any.
 This is the \"m.thread\" aggregation in EVENT's unsigned data."
@@ -4324,7 +4368,7 @@ from the server and the buffer re-rendered when it arrives."
                 (url-hexify-string (leman-room-id room))
                 (url-hexify-string root-id))
       :version "v1"
-      :params '(("dir" . "f") ("limit" . "200"))
+      :params '(("dir" "f") ("limit" "200"))
       :then (lambda (data)
               (when-let ((buffer-live buffer))
                 (with-current-buffer buffer
@@ -4405,7 +4449,7 @@ from the server and the buffer re-rendered when it arrives."
                   (url-hexify-string (leman-room-id leman-room))
                   (url-hexify-string root-id))
         :version "v1"
-        :params '(("dir" . "f") ("limit" . "200"))
+        :params '(("dir" "f") ("limit" "200"))
         :then (lambda (data)
                 (when (buffer-live-p buffer)
                   (with-current-buffer buffer
