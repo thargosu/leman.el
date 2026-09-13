@@ -425,6 +425,9 @@ Useful in, e.g. `leman-disconnect-hook', which see."
 
 ;;;;; E2EE integration
 
+;; Encrypt outgoing message content before sending.
+(setf leman-encrypt-send-content-function #'leman-e2ee--encrypt-content)
+
 (defun leman-e2ee--start-agent (session &optional then)
   "Start an E2EE agent for SESSION, then call THEN, if given.
 THEN is also called when the agent can't be started (after a
@@ -543,6 +546,39 @@ When it succeeds, report the response to the agent."
                :else (lambda (plz-error)
                        (leman-message "Leman E2EE: request %s failed: %S"
                                       endpoint plz-error)))))
+
+(defun leman-e2ee--encrypt-content (session room content)
+  "Encrypt CONTENT for ROOM on SESSION, for sending.
+Return (CONTENT . EVENT-TYPE): the encrypted content with event
+type \"m.room.encrypted\", or the original content with
+\"m.room.message\" when the room is not encrypted.  Signal
+`leman-e2ee-error' if the room is encrypted but encryption fails
+(failing closed: never send plaintext into an encrypted room)."
+  (let ((agent (leman-session-e2ee session)))
+    (if (and agent (leman-room--encrypted-p room))
+        (let ((room-id (leman-room-id room))
+              (members (hash-table-keys (leman-room-members room))))
+          ;; Track the members' devices and complete the initial
+          ;; keys/query before encrypting, else the room key would be
+          ;; shared with nobody.
+          (leman-e2ee-update-tracked-users agent members)
+          (leman-e2ee--process-outgoing-requests session)
+          ;; Encrypt, retrying while the agent still needs key claims.
+          (let ((response nil))
+            (cl-loop for attempt from 1 upto 3
+                     do (setf response (leman-e2ee-encrypt-event
+                                        agent room-id "m.room.message" content members))
+                     while (equal (alist-get 'status response) "claims_pending")
+                     do (leman-e2ee--process-outgoing-requests session))
+            (if (equal (alist-get 'status response) "ok")
+                ;; Send the key shares before (or with) the event.
+                (progn (leman-e2ee--process-outgoing-requests session)
+                       (cons (alist-get 'content (alist-get 'event response))
+                             "m.room.encrypted"))
+              (signal 'leman-e2ee-error
+                      (list "encrypt" "unable to encrypt after retries")))))
+      ;; Not encrypted (or no agent): send as usual.
+      (cons content "m.room.message"))))
 
 ;;; Functions
 

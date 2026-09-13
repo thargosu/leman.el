@@ -223,10 +223,11 @@ bounded (e.g. 3 attempts) to avoid loops.
 
 1. Check the room is encrypted (~m.room.encryption~ state event).
 2. ~update_tracked_users~ with the room's member IDs.
-3. ~encrypt_room_event~ (retry on ~claims_pending~, pumping outgoing
-   requests between attempts; pump afterwards too, so key shares are
-   sent).
-4. ~PUT .../send/m.room.encrypted/{txn}~ with the encrypted event.
-5. Pump outgoing requests once more (key distribution continues in
+3. Pump outgoing requests (the keys/query queued by step 2 must
+   complete first, or the room key would be shared with nobody).
+4. ~encrypt_room_event~ (retry on ~claims_pending~, pumping outgoing
+   requests between attempts).
+5. ~PUT .../send/m.room.encrypted/{txn}~ with the encrypted event.
+6. Pump outgoing requests once more (key distribution continues in
    the background for newly seen devices).
 + Key backup commands (SSSS).

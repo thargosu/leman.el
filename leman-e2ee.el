@@ -93,10 +93,16 @@ trade-off as Pantalaimon)."
 
 (defun leman-e2ee--encode (id command &optional params)
   "Encode request ID, COMMAND, and PARAMS as a protocol line."
-  (json-serialize (append (list (cons 'id id)
-                                (cons 'cmd command))
-                          (when params
-                            (list (cons 'params params))))))
+  ;; NOTE: `json-encode' (not `json-serialize') is used because
+  ;; request params may contain string-keyed alists (e.g. message
+  ;; content built with `leman-alist'), which `json-serialize'
+  ;; rejects.  Absent sync fields then encode as null rather than an
+  ;; empty object; the agent treats both the same.  Arrays may be
+  ;; lists or vectors; both encode as JSON arrays.
+  (json-encode (append (list (cons 'id id)
+                             (cons 'cmd command))
+                       (when params
+                         (list (cons 'params params))))))
 
 (defun leman-e2ee--decode (line)
   "Decode a protocol LINE into an alist, or nil if unparseable."
@@ -374,6 +380,19 @@ found; the caller should retry when keys arrive)."
   "Track USERS' devices with AGENT (needed before encryption)."
   (leman-e2ee-request agent "update_tracked_users"
                       (list (cons 'users (vconcat users)))))
+
+(defun leman-e2ee-encrypt-event (agent room-id event-type content users)
+  "Encrypt CONTENT of EVENT-TYPE for ROOM-ID with AGENT.
+USERS are the room's member user IDs (for key sharing).  Return
+the response alist: \"status\" is \"ok\" with an \"event\" whose
+\"content\" is the encrypted event content, or
+\"claims_pending\" (the client must perform the pending outgoing
+requests, then retry).  Signal `leman-e2ee-error' on failure."
+  (leman-e2ee-request agent "encrypt_room_event"
+                      (list (cons 'room_id room-id)
+                            (cons 'event_type event-type)
+                            (cons 'content content)
+                            (cons 'users (vconcat users)))))
 
 ;;;; Footer
 

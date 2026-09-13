@@ -15,8 +15,10 @@
 (require 'leman-e2ee)
 (require 'leman-api)
 
+(declare-function leman--initial-transaction-id "leman")
 (declare-function leman--push-joined-room-events "leman")
 (declare-function leman-e2ee--decrypt-event "leman")
+(declare-function leman-e2ee--encrypt-content "leman")
 (declare-function leman-e2ee--perform-outgoing-request "leman")
 (declare-function leman-e2ee--process-outgoing-requests "leman")
 (declare-function leman-e2ee--sync-changes "leman")
@@ -40,9 +42,9 @@
   "Return (AGENT . SENT-LINES) for a fake agent.
 RESPONSES maps command symbols to OK values; unmatched commands
 get an empty OK object, and a value of the form (err CODE
-MESSAGE) produces an error response.  Request ids are echoed; the
-lines sent to the agent are collected (newest first) in
-SENT-LINES."
+MESSAGE) produces an error response.  Request ids are echoed;
+SENT-LINES is a dummy-headed list whose cdr holds the lines sent
+to the agent, newest first."
   (let ((sent-lines (list nil)))
     (cons (leman-e2ee--create
            :pending (make-hash-table :test #'eql)
@@ -356,6 +358,113 @@ SENT-LINES."
       (should (equal (leman-event-type event) "m.room.message"))
       (should (equal (alist-get 'body (leman-event-content event))
                      "It's a secret")))))
+
+;;;; E2: encrypting outgoing events
+
+(ert-deftest leman-e2ee-encrypt-event ()
+  (let* ((encrypted-content (list (cons 'algorithm "m.megolm.v1.aes-sha2")
+                                  (cons 'ciphertext "opaque")))
+         (fake (leman-e2ee-tests--fake-agent
+                (list (cons 'encrypt_room_event
+                            (list (cons 'status "ok")
+                                  (cons 'event (list (cons 'type "m.room.encrypted")
+                                                     (cons 'content encrypted-content))))))))
+         (response (leman-e2ee-encrypt-event (car fake) "!room:x.org"
+                                             "m.room.message"
+                                             '((msgtype . "m.text") (body . "hi"))
+                                             ["@alice:x.org"])))
+    (should (equal (alist-get 'status response) "ok"))
+    (should (equal (alist-get 'content (alist-get 'event response))
+                   encrypted-content))
+    ;; The request carried the room, type, content, and members.
+    (let* ((line (cadr (cdr fake)))
+           (params (alist-get 'params (leman-e2ee--decode line))))
+      (should (equal (alist-get 'room_id params) "!room:x.org"))
+      (should (equal (alist-get 'event_type params) "m.room.message"))
+      (should (equal (elt (alist-get 'users params) 0) "@alice:x.org")))))
+
+(ert-deftest leman-e2ee--encrypt-content-claims-then-encrypts ()
+  ;; The full send flow: track members, pump, encrypt (retrying while
+  ;; claims are pending, pumping between attempts), and pump again for
+  ;; the key shares.  Returns the encrypted content and event type.
+  (let* ((encrypted-content (list (cons 'algorithm "m.megolm.v1.aes-sha2")
+                                  (cons 'ciphertext "opaque")))
+         (encrypt-count 0)
+         ;; The fake responds \"claims_pending\" once, then \"ok\".
+         (fake (leman-e2ee-tests--fake-agent nil))
+         (session (make-leman-session))
+         (room (make-leman-room :id "!room:x.org"
+                                :members (make-hash-table :test #'equal)))
+         (content '((msgtype . "m.text") (body . "hi"))))
+    (setf (leman-session-e2ee session) (car fake))
+    (puthash "@alice:x.org" (make-leman-user :id "@alice:x.org")
+             (leman-room-members room))
+    ;; A room with an m.room.encryption state event.
+    (setf (leman-room-state room)
+          (list (make-leman-event :id "$enc-state" :type "m.room.encryption"
+                                  :content '((algorithm . "m.megolm.v1.aes-sha2")))))
+    ;; Make the fake's dispatch dynamic: claims_pending then ok.
+    (setf (leman-e2ee-fake (car fake))
+          (lambda (agent line)
+            (let* ((request (leman-e2ee--decode line))
+                   (id (alist-get 'id request))
+                   (cmd (alist-get 'cmd request)))
+              (pcase cmd
+                ("encrypt_room_event"
+                 (cl-incf encrypt-count)
+                 (leman-e2ee-handle-line
+                  agent
+                  (if (= encrypt-count 1)
+                      (json-encode `((id . ,id) (ok . ((status . "claims_pending")))))
+                    (json-encode `((id . ,id)
+                                   (ok . ((status . "ok")
+                                          (event . ((type . "m.room.encrypted")
+                                                    (content . ,encrypted-content))))))))))
+                (_ (leman-e2ee-handle-line
+                    agent (json-encode `((id . ,id) (ok)))))))))
+    (cl-letf (((symbol-function #'leman-api)
+               (lambda (_session _endpoint &rest _args) nil)))
+      (let ((result (leman-e2ee--encrypt-content session room content)))
+        (should (equal (cdr result) "m.room.encrypted"))
+        (should (equal (car result) encrypted-content))))
+    (should (= encrypt-count 2))))
+
+(ert-deftest leman-e2ee--encrypt-content-plaintext-rooms-untouched ()
+  ;; A room without encryption state (or without an agent) passes the
+  ;; content through unchanged.
+  (let* ((session (make-leman-session))
+         (room (make-leman-room :id "!room:x.org"))
+         (content '((msgtype . "m.text") (body . "hi"))))
+    (let ((result (leman-e2ee--encrypt-content session room content)))
+      (should (equal result (cons content "m.room.message"))))))
+
+(ert-deftest leman-send-message-encrypts-in-encrypted-rooms ()
+  ;; Sending into an encrypted room sends an m.room.encrypted event
+  ;; with the agent's encrypted content.
+  (let* ((encrypted-content (list (cons 'algorithm "m.megolm.v1.aes-sha2")
+                                  (cons 'ciphertext "opaque")))
+         (fake (leman-e2ee-tests--fake-agent
+                (list (cons 'encrypt_room_event
+                            (list (cons 'status "ok")
+                                  (cons 'event (list (cons 'type "m.room.encrypted")
+                                                     (cons 'content encrypted-content))))))))
+         (session (make-leman-session :transaction-id (leman--initial-transaction-id)))
+         (room (make-leman-room :id "!room:x.org"
+                                :members (make-hash-table :test #'equal)))
+         (requests nil))
+    (setf (leman-session-e2ee session) (car fake))
+    (setf (leman-room-state room)
+          (list (make-leman-event :id "$enc-state" :type "m.room.encryption"
+                                  :content '((algorithm . "m.megolm.v1.aes-sha2")))))
+    (cl-letf (((symbol-function #'leman-api)
+               (lambda (_session endpoint &rest args)
+                 (push (cons endpoint (plist-get args :data)) requests))))
+      (let ((leman-encrypt-send-content-function #'leman-e2ee--encrypt-content))
+        (leman-send-message room session :body "hi")))
+    (let ((request (car requests)))
+      (should (string-match-p "/send/m.room.encrypted/" (car request)))
+      (should (string-match-p "opaque" (cdr request)))
+      (should-not (string-match-p "\"body\"" (cdr request))))))
 
 ;;;; Footer
 

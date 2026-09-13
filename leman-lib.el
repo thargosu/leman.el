@@ -1195,6 +1195,13 @@ suggested room."
                                      (leman--format-room suggestion 'topic)))))))
     (alist-get selected-name name-to-room-session nil nil #'string=)))
 
+(defvar leman-encrypt-send-content-function nil
+  "Function to encrypt a message's content before sending, or nil.
+Called with (SESSION ROOM CONTENT) by `leman-send-message'; must
+return (CONTENT . EVENT-TYPE), with CONTENT possibly encrypted and
+EVENT-TYPE the type to send it as (e.g. \"m.room.encrypted\").
+Set by the E2EE integration.")
+
 (cl-defun leman-send-message (room session
                                    &key body formatted-body replying-to-event filter then)
   "Send message to ROOM on SESSION with BODY and FORMATTED-BODY.
@@ -1212,8 +1219,7 @@ e.g. `leman-room-send-org-filter')."
   (cl-assert (not (string-empty-p body)))
   (cl-assert (or (not formatted-body) (not (string-empty-p formatted-body))))
   (pcase-let* (((cl-struct leman-room (id room-id)) room)
-               (endpoint (format "rooms/%s/send/m.room.message/%s" (url-hexify-string room-id)
-                                 (leman--update-transaction-id session)))
+               (event-type "m.room.message")
                (formatted-body (when formatted-body
                                  (leman--format-body-mentions formatted-body room)))
                (content (leman-aprog1
@@ -1228,7 +1234,16 @@ e.g. `leman-room-send-org-filter')."
     (when replying-to-event
       (setf replying-to-event (leman--original-event-for replying-to-event session)
             content (leman--add-reply content replying-to-event room)))
-    (leman-api session endpoint :method 'put :data (json-encode content)
+    ;; E2EE: encrypt the content when the room requires it (the
+    ;; function also determines the event type to send).
+    (when leman-encrypt-send-content-function
+      (pcase-let ((`(,encrypted-content . ,encrypted-type)
+                   (funcall leman-encrypt-send-content-function session room content)))
+        (setf content encrypted-content
+              event-type encrypted-type)))
+    (leman-api session (format "rooms/%s/send/%s/%s" (url-hexify-string room-id)
+                               event-type (leman--update-transaction-id session))
+      :method 'put :data (json-encode content)
       :then (apply-partially then :room room :session session
                              ;; Data is added when calling back.
                              :content content :data))))
