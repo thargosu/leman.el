@@ -89,10 +89,19 @@ Phasing:
      - The live sync path deduplicates events by ID (re-delivery
        after a limited timeline otherwise shows duplicates).
 2. *Encrypt-send* ("E2"): send encrypted messages, automatic key
-   distribution to member devices.  Spec in ~e2ee/PROTOCOL.org~
-   (encrypt_room_event).
+   distribution to member devices.  DONE 2026-09-13.
+   + Working: ~encrypt_room_event~ (Olm session claiming, room key
+     sharing, Megolm encryption), send flow wired into
+     ~leman-send-message~ (messages and emotes) with a synchronous
+     request pump, fail-closed sending (no plaintext into encrypted
+     rooms), warning when a room has encrypted traffic but encryption
+     is inactive.  Verified against Element and FluffyChat on a real
+     homeserver.
+   + Follow-up: encrypt reactions (m.reaction) and other non-message
+     event types in encrypted rooms.
 3. *Verification* ("E3"): emoji/QR verification via the state
    machine; key import/export (export file GPG-encrypted by elisp).
+   Until then, other clients warn that leman's device is not verified.
 4. *Key backup* ("E4"): SSSS for cross-device history.
 
 TDD workflow (tests before code; monorepo, agent in ~e2ee/~):

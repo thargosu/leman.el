@@ -64,15 +64,20 @@ cargo on the ~exec-path~).  If the agent isn't found at connect
 time, a warning is shown; ~M-x leman-e2ee-status~ reports whether an
 agent is running and where the program was looked up.
 
-Current support (phase 1):
+Current support:
 
 + Decryption of encrypted rooms, including history after key receipt
++ Encryption of outgoing messages, with automatic key distribution to
+  member devices (fails closed: encrypted rooms never receive
+  plaintext, and unencrypted rooms are unaffected)
 + Automatic key uploads, device list tracking, key claiming
 + Room keys and sessions persisted in a local SQLite store
   (~$XDG_DATA_HOME/leman/crypto/~)
 
-Not yet (planned, see ~ROADMAP.org~): sending encrypted messages,
-device verification, key backup.
+Not yet (planned, see ~ROADMAP.org~): device verification (until
+then, other clients will show warnings such as "encrypted by a
+device not verified by its owner"), key backup, and encrypting
+reactions in encrypted rooms.
 
 * Development
 
