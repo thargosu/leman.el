@@ -518,11 +518,50 @@ requests are performed."
     (leman-e2ee--process-outgoing-requests session)))
 
 (defun leman-e2ee--process-outgoing-requests (session)
-  "Perform the E2EE agent's outgoing requests for SESSION."
+  "Perform the E2EE agent's outgoing requests for SESSION.
+Asynchronous; used from the sync path (the responses are reported
+to the agent as they arrive)."
   (when-let* ((agent (leman-session-e2ee session))
               (requests (leman-e2ee-outgoing-requests agent)))
     (cl-loop for request across requests
              do (leman-e2ee--perform-outgoing-request session agent request))))
+
+(defun leman-e2ee--perform-outgoing-request-sync (session agent request)
+  "Perform the agent's outgoing REQUEST synchronously.
+Return non-nil when the response was reported to the agent."
+  (pcase-let* (((map ('id id) ('method method) ('path path) ('body body)) request)
+               (`(,version ,endpoint) (leman-e2ee--split-path path))
+               (method (intern (downcase method))))
+    ;; NOTE: The body is a pre-encoded JSON string from the agent;
+    ;; pass it through verbatim.
+    (condition-case err
+        (let ((data (leman-api session endpoint
+                               :method method
+                               :version version
+                               :data body
+                               :then 'sync
+                               :else nil)))
+          (leman-e2ee-mark-request-as-sent agent id data)
+          t)
+      (plz-error
+       (leman-message "Leman E2EE: request %s failed: %S" endpoint (cdr err))
+       nil))))
+
+(defun leman-e2ee--process-outgoing-requests-sync (session)
+  "Perform the E2EE agent's outgoing requests for SESSION, synchronously.
+Used by the send path, which must complete key claims and room key
+shares before it can retry encryption.  Returns non-nil if all
+pending requests were performed and reported."
+  (when-let ((agent (leman-session-e2ee session)))
+    (catch 'stuck
+      (cl-loop for iteration from 1 upto 10
+               for requests = (leman-e2ee-outgoing-requests agent)
+               while (and requests (> (length requests) 0))
+               do (cl-loop for request across requests
+                           unless (leman-e2ee--perform-outgoing-request-sync
+                                   session agent request)
+                           do (throw 'stuck nil))
+               finally return t))))
 
 (defun leman-e2ee--perform-outgoing-request (session agent request)
   "Perform the agent's outgoing REQUEST on SESSION's homeserver.
@@ -560,19 +599,21 @@ type \"m.room.encrypted\", or the original content with
               (members (hash-table-keys (leman-room-members room))))
           ;; Track the members' devices and complete the initial
           ;; keys/query before encrypting, else the room key would be
-          ;; shared with nobody.
+          ;; shared with nobody.  The send path must pump
+          ;; synchronously: the retries below need the claims and
+          ;; shares to have been performed and reported.
           (leman-e2ee-update-tracked-users agent members)
-          (leman-e2ee--process-outgoing-requests session)
+          (leman-e2ee--process-outgoing-requests-sync session)
           ;; Encrypt, retrying while the agent still needs key claims.
           (let ((response nil))
             (cl-loop for attempt from 1 upto 3
                      do (setf response (leman-e2ee-encrypt-event
                                         agent room-id "m.room.message" content members))
                      while (equal (alist-get 'status response) "claims_pending")
-                     do (leman-e2ee--process-outgoing-requests session))
+                     do (leman-e2ee--process-outgoing-requests-sync session))
             (if (equal (alist-get 'status response) "ok")
                 ;; Send the key shares before (or with) the event.
-                (progn (leman-e2ee--process-outgoing-requests session)
+                (progn (leman-e2ee--process-outgoing-requests-sync session)
                        (cons (alist-get 'content (alist-get 'event response))
                              "m.room.encrypted"))
               (signal 'leman-e2ee-error

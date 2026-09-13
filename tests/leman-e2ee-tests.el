@@ -21,6 +21,7 @@
 (declare-function leman-e2ee--encrypt-content "leman")
 (declare-function leman-e2ee--perform-outgoing-request "leman")
 (declare-function leman-e2ee--process-outgoing-requests "leman")
+(declare-function leman-e2ee--process-outgoing-requests-sync "leman")
 (declare-function leman-e2ee--sync-changes "leman")
 
 ;;;; Helpers
@@ -437,6 +438,54 @@ to the agent, newest first."
          (content '((msgtype . "m.text") (body . "hi"))))
     (let ((result (leman-e2ee--encrypt-content session room content)))
       (should (equal result (cons content "m.room.message"))))))
+
+(ert-deftest leman-e2ee--process-outgoing-requests-sync-performs-and-marks ()
+  ;; The send path's pump performs requests synchronously (the caller
+  ;; must be able to rely on claims/shares being done when it
+  ;; returns) and reports the responses to the agent.
+  (let* ((fake (leman-e2ee-tests--fake-agent nil))
+         (session (make-leman-session))
+         (outgoing-count 0))
+    (setf (leman-session-e2ee session) (car fake))
+    ;; The agent wants one keys/claim performed, then nothing more.
+    ;; NOTE: The dynamic fake must push the line itself (it replaces
+    ;; the fake installed by the helper).
+    (setf (leman-e2ee-fake (car fake))
+          (lambda (agent line)
+            (let ((sent-lines (cdr fake)))
+              (setcdr sent-lines (cons line (cdr sent-lines)))
+              (let* ((request (leman-e2ee--decode line))
+                     (id (alist-get 'id request))
+                     (cmd (alist-get 'cmd request)))
+                (pcase cmd
+                  ("outgoing_requests"
+                   (cl-incf outgoing-count)
+                   (leman-e2ee-handle-line
+                    agent
+                    (if (= outgoing-count 1)
+                        (json-encode
+                         `((id . ,id)
+                           (ok . ((requests . [((id . "req1")
+                                                (method . "POST")
+                                                (path . "/_matrix/client/v3/keys/claim")
+                                                (body . "{\"one_time_keys\":{},\"timeout\":null}"))])))))
+                      (json-encode `((id . ,id) (ok . ((requests . []))))))))
+                  (_ (leman-e2ee-handle-line
+                      agent (json-encode `((id . ,id) (ok))))))))))
+    (cl-letf (((symbol-function #'leman-api)
+               (lambda (_session _endpoint &rest args)
+                 (should (eq (plist-get args :then) 'sync))
+                 '((one_time_keys)))))
+      (leman-e2ee--process-outgoing-requests-sync session))
+    (let* ((lines (cdr (cdr fake)))
+           (mark (seq-find (lambda (line)
+                             (equal (alist-get 'cmd (leman-e2ee--decode line))
+                                    "mark_request_as_sent"))
+                           lines)))
+      (should mark)
+      (should (equal (alist-get 'request_id
+                                (alist-get 'params (leman-e2ee--decode mark)))
+                     "req1")))))
 
 (ert-deftest leman-send-message-encrypts-in-encrypted-rooms ()
   ;; Sending into an encrypted room sends an m.room.encrypted event
