@@ -496,6 +496,11 @@ impl Agent {
                     .map_err(crypto_error)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if users.is_empty() {
+            // Refuse: the room key would be shared with nobody, and
+            // the event could never be decrypted by other members.
+            return Err(AgentError::Crypto(anyhow!("empty users")));
+        }
 
         // Claim one-time keys for devices we have no Olm session with.
         if let Some((txn_id, claim_request)) = machine
