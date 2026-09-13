@@ -7,7 +7,8 @@ use anyhow::{anyhow, Context, Result};
 use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use matrix_sdk_crypto::{
     types::events::room::encrypted::EncryptedEvent, types::requests::AnyOutgoingRequest,
-    DecryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement,
+    DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine,
+    TrustRequirement,
 };
 use ruma::{
     api::client as client_api,
@@ -76,6 +77,10 @@ enum PendingKind {
 pub struct Agent {
     machine: Option<OlmMachine>,
     pending: BTreeMap<String, PendingKind>,
+    /// Outgoing requests stashed by commands like `encrypt_room_event`
+    /// (key claims and room key shares), merged into the next
+    /// `outgoing_requests` response.
+    extra_requests: Vec<Value>,
 }
 
 impl Default for Agent {
@@ -89,6 +94,7 @@ impl Agent {
         Self {
             machine: None,
             pending: BTreeMap::new(),
+            extra_requests: Vec::new(),
         }
     }
 
@@ -145,6 +151,7 @@ impl Agent {
             "receive_sync_changes" => self.receive_sync_changes(params).await,
             "decrypt_room_event" => self.decrypt_room_event(params).await,
             "update_tracked_users" => self.update_tracked_users(params).await,
+            "encrypt_room_event" => self.encrypt_room_event(params).await,
             other => Err(AgentError::UnknownCommand(other.to_owned())),
         }
     }
@@ -186,8 +193,7 @@ impl Agent {
             .map_err(crypto_error)?;
         let mut serialized = Vec::new();
         for request in requests {
-            let request_id = request.request_id().to_string();
-            let (kind, method, path, body) = match request.request() {
+            let request_id = request.request_id().to_string();            let (kind, method, path, body) = match request.request() {
                 AnyOutgoingRequest::KeysUpload(request) => (
                     PendingKind::KeysUpload,
                     "POST".to_owned(),
@@ -262,6 +268,8 @@ impl Agent {
                 "body": body,
             }));
         }
+        // Include requests stashed by commands like `encrypt_room_event`.
+        serialized.append(&mut self.extra_requests);
         Ok(json!({"requests": serialized}))
     }
 
@@ -459,6 +467,112 @@ impl Agent {
             .await
             .map_err(crypto_error)?;
         Ok(json!({}))
+    }
+
+    /// Encrypt an event's content with Megolm (E2).  The room key is
+    /// shared with the given members' devices first; any Olm sessions
+    /// that are still missing cause a `claims_pending` response, with
+    /// the keys/claim request stashed for the client to perform
+    /// before retrying.
+    async fn encrypt_room_event(&mut self, params: Value) -> CommandResult {
+        let machine = self.machine()?;
+        let room_id: ruma::OwnedRoomId = param_str(&params, "room_id")?
+            .parse()
+            .map_err(crypto_error)?;
+        let event_type = param_str(&params, "event_type")?.to_owned();
+        let content = params
+            .get("content")
+            .cloned()
+            .ok_or_else(|| AgentError::Crypto(anyhow!("missing param \"content\"")))?;
+        let users: Vec<ruma::OwnedUserId> = params
+            .get("users")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AgentError::Crypto(anyhow!("missing param \"users\"")))?
+            .iter()
+            .map(|user| {
+                user.as_str()
+                    .ok_or_else(|| AgentError::Crypto(anyhow!("invalid user")))?
+                    .parse()
+                    .map_err(crypto_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Claim one-time keys for devices we have no Olm session with.
+        if let Some((txn_id, claim_request)) = machine
+            .get_missing_sessions(users.iter().map(|user| user.as_ref()))
+            .await
+            .map_err(crypto_error)?
+        {
+            let request_id = txn_id.as_str().to_owned();
+            let body = serde_json::to_string(&json!({
+                "one_time_keys": claim_request.one_time_keys,
+                "timeout": claim_request.timeout
+                    .map(|timeout| timeout.as_millis() as u64),
+            }))
+            .context("serializing keys/claim body")
+            .map_err(crypto_error)?;
+            let entry = json!({
+                "id": request_id,
+                "method": "POST",
+                "path": "/_matrix/client/v3/keys/claim",
+                "body": body,
+            });
+            self.pending.insert(request_id, PendingKind::KeysClaim);
+            self.extra_requests.push(entry);
+            return Ok(json!({"status": "claims_pending"}));
+        }
+
+        // Share the room key with the members' devices.  The share
+        // requests are stashed as outgoing requests; other clients
+        // cannot decrypt until the client has performed them.
+        let share_requests = machine
+            .share_room_key(
+                &room_id,
+                users.iter().map(|user| user.as_ref()),
+                EncryptionSettings::default(),
+            )
+            .await
+            .map_err(crypto_error)?;
+        let mut stashed = Vec::new();
+        for send in share_requests {
+            let request_id = send.txn_id.as_str().to_owned();
+            let body = serde_json::to_string(&json!({"messages": send.messages}))
+                .context("serializing sendToDevice body")
+                .map_err(crypto_error)?;
+            let path = format!(
+                "/_matrix/client/v3/sendToDevice/{}/{}",
+                send.event_type, send.txn_id
+            );
+            stashed.push((request_id, path, body));
+        }
+
+        let content_raw_value = serde_json::value::RawValue::from_string(content.to_string())
+            .context("serializing content")
+            .map_err(crypto_error)?;
+        let content_raw = Raw::from_json(content_raw_value);
+        let encrypted = machine
+            .encrypt_room_event_raw(&room_id, &event_type, &content_raw)
+            .await
+            .map_err(crypto_error)?;
+        let encrypted_content =
+            serde_json::to_value(&encrypted.content)
+                .context("serializing encrypted content")
+                .map_err(crypto_error)?;
+
+        // The machine is not needed anymore; stash the share requests.
+        for (request_id, path, body) in stashed {
+            self.pending.insert(request_id.clone(), PendingKind::ToDevice);
+            self.extra_requests.push(json!({
+                "id": request_id,
+                "method": "PUT",
+                "path": path,
+                "body": body,
+            }));
+        }
+        Ok(json!({
+            "status": "ok",
+            "event": {"type": "m.room.encrypted", "content": encrypted_content},
+        }))
     }
 }
 

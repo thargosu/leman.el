@@ -9,7 +9,12 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 
-use matrix_sdk_crypto::OlmMachine;
+use matrix_sdk_crypto::{
+    types::events::room::encrypted::EncryptedEvent, types::requests::AnyOutgoingRequest,
+    DecryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement,
+};
+use ruma::api::client::keys::upload_keys::v3::Response as UploadKeysResponse;
+use ruma::events::AnyToDeviceEvent;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -281,6 +286,216 @@ fn test_hello() {
     let mut agent = TestAgent::spawn();
     let response = agent.request("hello", json!({}));
     assert_eq!(response["ok"]["protocol_version"], json!(1));
+}
+
+/// Respond to the agent's outgoing requests as a virtual homeserver.
+/// `alice_keys`/`alice_otk` are Alice's published key uploads (used to
+/// answer keys/query and keys/claim); returns the to-device messages
+/// the agent wanted sent, as raw events for Alice's machine.
+fn pump_agent(agent: &mut TestAgent, alice_keys: &Value, alice_otk: &Value) -> Vec<Value> {
+    let mut sent_to_device = Vec::new();
+    // The agent machine always tracks its own user, so keys/query
+    // responses must also include its own device keys, or it will
+    // re-query forever.
+    let mut bob_device_keys = None;
+    loop {
+        let outgoing = agent.request("outgoing_requests", json!({}));
+        let requests = outgoing["ok"]["requests"].as_array().unwrap().clone();
+        if requests.is_empty() {
+            break;
+        }
+        for request in requests {
+            let path = request["path"].as_str().unwrap().to_owned();
+            let response = if path.contains("/keys/upload") {
+                // Report the number of one-time keys the server now
+                // holds, else the machine keeps generating and
+                // uploading more of them.
+                let body: Value =
+                    serde_json::from_str(request["body"].as_str().unwrap()).unwrap();
+                bob_device_keys = Some(body["device_keys"].clone());
+                let otk_count = body["one_time_keys"]
+                    .as_object()
+                    .map(|keys| keys.len())
+                    .unwrap_or(0);
+                json!({"one_time_key_counts": {"signed_curve25519": otk_count}})
+            } else if path.contains("/keys/query") {
+                let mut device_keys = json!({
+                    "@alice:example.org": {"ALICEDEVICE": alice_keys},
+                });
+                if let Some(bob) = &bob_device_keys {
+                    device_keys["@bob:example.org"] = json!({"BOBDEVICE": bob});
+                }
+                json!({"device_keys": device_keys, "failures": {}})
+            } else if path.contains("/keys/claim") {
+                let key_id = alice_otk
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .next()
+                    .unwrap()
+                    .clone();
+                let key_value = alice_otk.as_object().unwrap().values().next().unwrap().clone();
+                json!({
+                    "one_time_keys": {
+                        "@alice:example.org": {"ALICEDEVICE": {key_id: key_value}},
+                    },
+                    "failures": {},
+                })
+            } else if path.contains("/sendToDevice") {
+                let body: Value = serde_json::from_str(request["body"].as_str().unwrap()).unwrap();
+                for user_messages in body["messages"].as_object().unwrap().values() {
+                    if let Some(devices) = user_messages.as_object() {
+                        for content in devices.values() {
+                            sent_to_device.push(json!({
+                                "sender": "@bob:example.org",
+                                "type": "m.room.encrypted",
+                                "content": content,
+                            }));
+                        }
+                    }
+                }
+                json!({})
+            } else {
+                panic!("unexpected outgoing request path: {path}")
+            };
+            let mark = agent.request(
+                "mark_request_as_sent",
+                json!({"request_id": request["id"], "response": response}),
+            );
+            if mark.get("err").is_some() {
+                eprintln!("pump: mark FAILED for {path}: {mark}");
+            }
+        }
+    }
+    sent_to_device
+}
+
+/// The agent encrypts an event for a room whose other member is Alice
+/// (an in-process machine), and Alice decrypts it.  Exercises the
+/// full E2 send flow: tracking, keys/claim dance, room key sharing,
+/// and encryption, all through the protocol layer.
+#[tokio::test]
+async fn test_agent_encrypts_event() {
+    // Alice publishes her keys through the harness.
+    let alice = OlmMachine::new(
+        ruma::user_id!("@alice:example.org"),
+        ruma::device_id!("ALICEDEVICE"),
+    )
+    .await;
+    let mut alice_keys = None;
+    let mut alice_otk = None;
+    for request in alice.outgoing_requests().await.unwrap() {
+        if let AnyOutgoingRequest::KeysUpload(upload) = request.request() {
+            alice_keys = Some(serde_json::to_value(&upload.device_keys).unwrap());
+            alice_otk = Some(serde_json::to_value(&upload.one_time_keys).unwrap());
+            alice
+                .mark_request_as_sent(
+                    request.request_id(),
+                    &UploadKeysResponse::new(BTreeMap::new()),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let alice_keys = alice_keys.expect("alice should upload keys");
+    let alice_otk = alice_otk.expect("alice should upload one-time keys");
+
+    // The agent (Bob) tracks Alice and tries to encrypt.
+    let mut agent = TestAgent::spawn();
+    let store = TempDir::new().unwrap();
+    let initialize = agent.request("initialize", initialize_params(&store));
+    assert!(initialize["ok"].is_object());
+    let bob_sender_key = initialize["ok"]["identity_keys"]["curve25519"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    agent.request(
+        "update_tracked_users",
+        json!({"users": ["@alice:example.org"]}),
+    );
+
+    let encrypt_params = json!({
+        "room_id": "!room:example.org",
+        "event_type": "m.room.message",
+        "content": {"msgtype": "m.text", "body": "from the agent"},
+        "users": ["@alice:example.org"],
+    });
+    // Pump first: the keys/query for Alice's devices (queued by
+    // update_tracked_users) must complete before encrypting, otherwise
+    // the key would be shared with nobody.
+    let _sent = pump_agent(&mut agent, &alice_keys, &alice_otk);
+    let response = agent.request("encrypt_room_event", encrypt_params.clone());
+    // First encrypt attempt: Olm sessions with Alice's device are missing.
+    assert_eq!(
+        response["ok"]["status"],
+        json!("claims_pending"),
+        "expected claims_pending: {response}"
+    );
+
+    // Perform the pending requests (claim + others).
+    let _sent = pump_agent(&mut agent, &alice_keys, &alice_otk);
+
+    // Retry: now the agent can share a room key and encrypt.
+    let response = agent.request("encrypt_room_event", encrypt_params.clone());
+    let event = &response["ok"]["event"];
+    assert_eq!(
+        event["type"],
+        json!("m.room.encrypted"),
+        "expected an encrypted event: {response}"
+    );
+
+    // Perform the key-share to-device requests and deliver them to
+    // Alice's machine.
+    let sent = pump_agent(&mut agent, &alice_keys, &alice_otk);
+    assert!(
+        !sent.is_empty(),
+        "the agent should share the room key with Alice's device"
+    );
+    let room_key_events: Vec<_> = sent
+        .iter()
+        .map(raw_from_value::<AnyToDeviceEvent>)
+        .collect();
+    alice
+        .receive_sync_changes(
+            EncryptionSyncChanges {
+                to_device_events: room_key_events,
+                changed_devices: &Default::default(),
+                one_time_keys_counts: &Default::default(),
+                unused_fallback_keys: None,
+                next_batch_token: None,
+            },
+            &DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::Untrusted,
+            },
+        )
+        .await
+        .unwrap();
+
+    // Alice decrypts the event the agent produced.
+    let decrypted = alice
+        .decrypt_room_event(
+            &raw_from_value::<EncryptedEvent>(
+                &json!({
+                    "sender": "@bob:example.org",
+                    "sender_key": bob_sender_key,
+                    "type": "m.room.encrypted",
+                    "event_id": "$fake",
+                    "room_id": "!room:example.org",
+                    "origin_server_ts": 0,
+                    "content": event["content"].clone(),
+                }),
+            ),
+            ruma::room_id!("!room:example.org"),
+            &DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::Untrusted,
+            },
+        )
+        .await
+        .expect("alice should decrypt the agent's event");
+    assert_eq!(
+        serde_json::to_value(decrypted.event).unwrap()["content"]["body"],
+        json!("from the agent")
+    );
 }
 
 #[test]
