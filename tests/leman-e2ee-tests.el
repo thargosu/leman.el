@@ -439,6 +439,24 @@ to the agent, newest first."
     (let ((result (leman-e2ee--encrypt-content session room content)))
       (should (equal result (cons content "m.room.message"))))))
 
+(ert-deftest leman-e2ee--encrypt-content-warns-on-plaintext-into-encrypted-room ()
+  ;; Sending plaintext into a room whose timeline contains encrypted
+  ;; events (i.e. the room really is encrypted but encryption isn't
+  ;; active for us) must warn loudly, not silently.
+  (let* ((session (make-leman-session))
+         (room (make-leman-room :id "!room:x.org"))
+         (content '((msgtype . "m.text") (body . "hi")))
+         (warnings nil))
+    (setf (leman-room-timeline room)
+          (list (make-leman-event :id "$enc1" :type "m.room.encrypted"
+                                  :content '((algorithm . "m.megolm.v1.aes-sha2")))))
+    (cl-letf (((symbol-function #'leman-message)
+               (lambda (format &rest args)
+                 (push (apply #'format format args) warnings))))
+      (leman-e2ee--encrypt-content session room content))
+    (should (= 1 (length warnings)))
+    (should (string-match-p "NOT be encrypted" (car warnings)))))
+
 (ert-deftest leman-e2ee--process-outgoing-requests-sync-performs-and-marks ()
   ;; The send path's pump performs requests synchronously (the caller
   ;; must be able to rely on claims/shares being done when it

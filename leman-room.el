@@ -2242,18 +2242,12 @@ the content (e.g. see `leman-room-send-org-filter')."
                                             nil 'inherit-input-method))))
        (list leman-room leman-session :body body))))
   (cl-assert (not (string-empty-p body)))
-  (pcase-let* (((cl-struct leman-room (id room-id) (local (map buffer))) room)
-               (window (when buffer (get-buffer-window buffer)))
-               (endpoint (format "rooms/%s/send/m.room.message/%s" (url-hexify-string room-id)
-                                 (leman--update-transaction-id session)))
-               (content (leman-aprog1
-                            (leman-alist "msgtype" "m.emote"
-                                         "body" body))))
-    (when leman-room-send-message-filter
-      (setf content (funcall leman-room-send-message-filter content room)))
-    (leman-api session endpoint :method 'put :data (json-encode content)
-      :then (apply-partially #'leman-room-send-event-callback :room room :session session
-                             :content content :data)) ;; Data is added when calling back.
+  (pcase-let* (((cl-struct leman-room (local (map buffer))) room)
+               (window (when buffer (get-buffer-window buffer))))
+    (leman-send-message room session :body body :msgtype "m.emote"
+      :filter leman-room-send-message-filter
+      :then (apply-partially #'leman-room-send-event-callback :room room
+                             :session session))
     ;; NOTE: This assumes that the selected window is the buffer's window.  For now
     ;; this is almost surely the case, but in the future, we might let the function
     ;; send messages to other rooms more easily, so this assumption might not hold.

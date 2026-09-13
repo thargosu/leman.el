@@ -1203,11 +1203,13 @@ EVENT-TYPE the type to send it as (e.g. \"m.room.encrypted\").
 Set by the E2EE integration.")
 
 (cl-defun leman-send-message (room session
-                                   &key body formatted-body replying-to-event filter then)
+                                   &key body formatted-body replying-to-event filter then
+                                   (msgtype "m.text"))
   "Send message to ROOM on SESSION with BODY and FORMATTED-BODY.
-THEN may be a function to call after the event is sent
-successfully.  It is called with keyword arguments for ROOM,
-SESSION, CONTENT, and DATA.
+MSGTYPE is the message's type (\"m.text\" by default, e.g.
+\"m.emote\" for emotes).  THEN may be a function to call after the
+event is sent successfully.  It is called with keyword arguments
+for ROOM, SESSION, CONTENT, and DATA.
 
 REPLYING-TO-EVENT may be an event the message is
 in reply to; the message will reference it appropriately.
@@ -1223,7 +1225,7 @@ e.g. `leman-room-send-org-filter')."
                (formatted-body (when formatted-body
                                  (leman--format-body-mentions formatted-body room)))
                (content (leman-aprog1
-                            (leman-alist "msgtype" "m.text"
+                            (leman-alist "msgtype" msgtype
                                          "body" body)
                           (when formatted-body
                             (push (cons "formatted_body" formatted-body) it)

@@ -618,7 +618,14 @@ type \"m.room.encrypted\", or the original content with
                              "m.room.encrypted"))
               (signal 'leman-e2ee-error
                       (list "encrypt" "unable to encrypt after retries")))))
-      ;; Not encrypted (or no agent): send as usual.
+      ;; Not encrypted (or no agent): send as usual.  If the room's
+      ;; timeline contains encrypted events, the room really is
+      ;; encrypted but encryption isn't active for us: warn loudly
+      ;; rather than silently sending plaintext into it.
+      (when (cl-find "m.room.encrypted" (leman-room-timeline room)
+                     :test #'equal :key #'leman-event-type)
+        (leman-message "Leman E2EE: WARNING: room %s has encrypted messages, but this message will NOT be encrypted (no agent or room state missing encryption)"
+                       (leman-room-id room)))
       (cons content "m.room.message"))))
 
 ;;; Functions
